@@ -37,7 +37,7 @@ author them.
 | Motor system (scheduler, ViGEm pad) | Done, hardened, verified on real hardware |
 | Profiles (game facts as config) | Done, pause chord verified in-game |
 | Window find/focus | Done |
-| Eyes (screen capture) | Next |
+| Eyes (screen capture) | Done, hardened, verified against a live game |
 | Recorder (synchronized demonstrations) | Next |
 | Keyboard/mouse + text entry | Planned |
 | Ears, voice, memory, MCP control plane | Planned |
@@ -67,6 +67,12 @@ player2> quit
 
 `session` keeps one virtual pad open for its lifetime and focuses the game itself — both of
 which matter more than they sound. See [docs/PLATFORM-NOTES.md](docs/PLATFORM-NOTES.md).
+
+To see what the agent sees:
+
+```bash
+python -m player2.demo capture --profile profiles/factorio.toml --frames 6
+```
 
 Not working? `python -m player2.demo readback` drives the pad and reads its real state back
 out of Windows, **with no game running**, which settles "is our pad broken or is the game
