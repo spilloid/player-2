@@ -1,4 +1,4 @@
-def test_import_player2():
+def test_package_imports() -> None:
     import player2
 
-    assert True
+    assert player2.__name__ == "player2"
