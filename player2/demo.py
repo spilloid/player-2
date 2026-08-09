@@ -10,8 +10,14 @@ greps player2/ for game names. That test is deliberately blunt: the day it start
 weakened to accommodate a "harmless" mention is the day the boundary starts eroding.)
 
 Usage:
+    python -m player2.demo session    keep ONE pad plugged in and drive it interactively
     python -m player2.demo probe      verify the virtual pad exists and Windows sees it
     python -m player2.demo readback   drive the stick and read the pad's real state back
+
+Prefer `session` for anything interactive. The one-shot commands create a virtual
+controller and destroy it on exit, which the game sees as a device being hot-plugged and
+yanked out -- and titles with console ports typically pause when the active controller
+disappears, so the next command then runs against a paused game.
     python -m player2.demo square     walk a square, then release
     python -m player2.demo deadman    hold forward, then go silent to prove the pad releases
     python -m player2.demo macro --profile <toml> --name <macro>   replay one named macro
@@ -220,6 +226,99 @@ def hold(direction: str, seconds: float, dry_run: bool, delay: float = 0.0) -> i
     return _run([chunk], dry_run=dry_run, delay=delay)
 
 
+SESSION_HELP = """commands:
+  up | down | left | right [seconds]   hold one direction (default 2s)
+  square [seconds]                     walk a square
+  macro <name>                         replay a named macro from --profile
+  macros                               list macros in the loaded profile
+  events                               print buffered scheduler events
+  help | quit
+"""
+
+
+def session(profile_path: str | None) -> int:
+    """Keep ONE virtual pad plugged in and drive it interactively.
+
+    Every one-shot command creates a virtual controller and destroys it on exit, which the
+    game sees as a real device being hot-plugged and yanked out. Games log a fresh
+    controller-connected instance for each run -- and titles with console ports typically
+    pause when the active controller vanishes. Test after test then began against a paused
+    game, which looked exactly like broken movement.
+
+    The deeper point is that the agent's hands should outlive any single decision. The real
+    runtime is long-lived so it gets this for free; a one-shot CLI does not.
+    """
+    from player2.control.vigem import ViGEmXboxAdapter
+
+    profile = load_profile(Path(profile_path)) if profile_path else None
+    output = ViGEmXboxAdapter()
+    scheduler = Scheduler(output=output, clock=SessionClock(), max_hold_ms=250.0)
+    thread = SchedulerThread(scheduler)
+    thread.start()
+    seq = 0
+    print("virtual pad connected and STAYING connected until you quit.")
+    print(SESSION_HELP)
+    try:
+        while True:
+            try:
+                raw = input("player2> ").strip().split()
+            except EOFError:
+                break
+            if not raw:
+                continue
+            cmd, rest = raw[0].lower(), raw[1:]
+            if cmd in {"quit", "exit", "q"}:
+                break
+            if cmd in {"help", "?"}:
+                print(SESSION_HELP)
+                continue
+            if cmd == "events":
+                for event in scheduler.drain_events():
+                    print(f"  {event.kind} @{event.session_ms:.0f}ms  {event.detail}")
+                continue
+            if cmd == "macros":
+                print("  " + (", ".join(sorted(profile.macros)) if profile else "no --profile"))
+                continue
+
+            pending: list[ActionChunk] = []
+            if cmd in DIRECTIONS:
+                secs = float(rest[0]) if rest else 2.0
+                vector = DIRECTIONS[cmd]
+                pending = [ActionChunk(keyframes=(
+                    Keyframe(t_ms=0.0, left_stick=vector),
+                    Keyframe(t_ms=secs * 1000.0, left_stick=vector),
+                ))]
+            elif cmd == "square":
+                secs = float(rest[0]) if rest else 1.5
+                pending = [ActionChunk(keyframes=(
+                    Keyframe(t_ms=0.0, left_stick=v),
+                    Keyframe(t_ms=secs * 1000.0, left_stick=v),
+                )) for v in DIRECTIONS.values()]
+            elif cmd == "macro":
+                if profile is None or not rest:
+                    print("  need --profile and a macro name")
+                    continue
+                try:
+                    pending = [profile.get_macro(rest[0])]
+                except KeyError as error:
+                    print(f"  {error}")
+                    continue
+            else:
+                print(f"  unknown command '{cmd}'")
+                continue
+
+            for chunk in pending:
+                seq += 1
+                if scheduler.submit(replace(chunk, decision_seq=seq)):
+                    time.sleep(chunk.duration_ms / 1000.0)
+                else:
+                    print(f"  chunk seq={seq} REJECTED")
+    finally:
+        thread.stop()
+        print("pad released and disconnected")
+    return 0
+
+
 def _wrap_chunk(profile_path: str | None) -> ActionChunk | None:
     """Load the profile's nominated wrap macro, if a profile was supplied."""
     if not profile_path:
@@ -279,7 +378,8 @@ def macro(profile_path: str, name: str, dry_run: bool, delay: float = 0.0) -> in
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command",
-                        choices=["probe", "readback", "hold", "square", "deadman", "macro"])
+                        choices=["probe", "readback", "session", "hold", "square",
+                                 "deadman", "macro"])
     parser.add_argument("--direction", choices=sorted(DIRECTIONS), default="right",
                         help="direction for the 'hold' command")
     parser.add_argument("--seconds", type=float, default=1.0, help="seconds per side")
@@ -299,6 +399,8 @@ def main(argv: list[str] | None = None) -> int:
         return probe()
     if args.command == "readback":
         return readback()
+    if args.command == "session":
+        return session(args.profile)
     if args.command == "hold":
         return hold(args.direction, args.seconds, args.dry_run, delay)
     if args.command == "macro":

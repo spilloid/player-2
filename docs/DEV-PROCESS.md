@@ -27,6 +27,40 @@ Eleven seconds apart — exactly the demo run. That single line eliminated the e
 "our code is broken" branch and pointed straight at `input-method=keyboard-and-mouse`.
 **Rule: when an integration fails, read the other system's logs before touching your own code.**
 
+## The controller-lifetime bug — found by Joey, not by the models
+
+Symptom: the character walked three sides of a square but not the first, and the game
+"paused itself" at the end even though the command being run pressed **no buttons at all**.
+
+Claude proposed terrain and focus-change. Both wrong. Joey's guess — *"I think it's you
+unplugging the controller"* — was right, and the log proved it immediately:
+
+```
+instance: 0 ... connected / disconnected
+instance: 1 ... connected / disconnected
+instance: 2 ... connected / disconnected
+```
+
+**Every one-shot CLI run hot-plugs a brand-new virtual controller and rips it out.** Titles
+with console ports pause when the active controller disappears, so each run left the game
+paused, and the *next* run spent its first chunk getting back into a running game. Both
+symptoms, one cause.
+
+Why the models missed it: the defect was not in any diff. Every module was individually
+correct, all 230 tests passed, and the bug lived in the *lifetime* of a resource across
+process boundaries — visible only by watching the system behave over several runs. Neither
+reviewer was ever shown that, because a diff cannot contain it.
+
+The architectural lesson outlives the demo: **the agent's hands must outlive any single
+decision.** The real runtime is long-lived and gets this free; a one-shot CLI does not. It
+also would have quietly corrupted the demonstration dataset later — a device that vanishes
+between recordings breaks exactly the continuity the dataset exists to capture. Fixed with
+`demo session`, which keeps one pad plugged in.
+
+**Rule: adversarial review reads diffs, so it finds defects that live in diffs. Bugs in
+lifetime, deployment, and cross-run state need someone watching the real system.** Budget
+for that separately; do not expect a reviewer to supply it.
+
 ## Findings
 
 _Provisional after 2 units. Do not trust these yet; first real revision after Unit 5._
