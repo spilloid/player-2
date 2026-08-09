@@ -2,6 +2,31 @@
 
 This file records every adversarial review round between the lead engineer (Claude) and the consultant (Codex), and exists to derive a routing policy from our own measurements rather than vendor benchmarks.
 
+## Milestone 1 — reached 2026-08-09
+
+**An agent process manipulated a real commercial game through a standard controller
+abstraction.** Factorio 2.0.7, virtual Xbox pad via ViGEm, action chunks authored the same way
+a model will author them. No game API, no memory reading, no injection — the same input device
+a human uses.
+
+Observed in the live run: 6 chunks accepted, 5 preemptions as each new intent replaced the
+previous one, and the deadman releasing the pad at 6706ms when the agent went silent. The
+safety property that matters most — *silence means stop* — held in a real game, not just in
+tests.
+
+Getting there took one diagnostic worth remembering. When the first attempt moved nothing, the
+question "is our pad broken or is the game ignoring it?" was answered not by guessing but by
+Factorio's own log:
+
+```
+166.051 Game controller connected: instance: 0, Xbox 360 Controller
+177.201 Game controller disconnected: instance: 0, Xbox 360 Controller
+```
+
+Eleven seconds apart — exactly the demo run. That single line eliminated the entire
+"our code is broken" branch and pointed straight at `input-method=keyboard-and-mouse`.
+**Rule: when an integration fails, read the other system's logs before touching your own code.**
+
 ## Findings
 
 _Provisional after 2 units. Do not trust these yet; first real revision after Unit 5._
