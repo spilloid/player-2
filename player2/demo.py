@@ -10,9 +10,11 @@ greps player2/ for game names. That test is deliberately blunt: the day it start
 weakened to accommodate a "harmless" mention is the day the boundary starts eroding.)
 
 Usage:
-    python -m player2.demo probe     verify the virtual pad exists and Windows sees it
-    python -m player2.demo square    walk a square, then release
-    python -m player2.demo deadman   hold forward, then go silent to prove the pad releases
+    python -m player2.demo probe      verify the virtual pad exists and Windows sees it
+    python -m player2.demo readback   drive the stick and read the pad's real state back
+    python -m player2.demo square     walk a square, then release
+    python -m player2.demo deadman    hold forward, then go silent to prove the pad releases
+    python -m player2.demo macro --profile <toml> --name <macro>   replay one named macro
 """
 
 from __future__ import annotations
@@ -39,8 +41,29 @@ DIRECTIONS: dict[str, tuple[float, float]] = {
 }
 
 
+class _XInputGamepad(ctypes.Structure):
+    _fields_ = [
+        ("wButtons", ctypes.c_uint16),
+        ("bLeftTrigger", ctypes.c_uint8),
+        ("bRightTrigger", ctypes.c_uint8),
+        ("sThumbLX", ctypes.c_int16),
+        ("sThumbLY", ctypes.c_int16),
+        ("sThumbRX", ctypes.c_int16),
+        ("sThumbRY", ctypes.c_int16),
+    ]
+
+
 class _XInputState(ctypes.Structure):
-    _fields_ = [("dwPacketNumber", ctypes.c_uint32), ("Gamepad", ctypes.c_byte * 12)]
+    _fields_ = [("dwPacketNumber", ctypes.c_uint32), ("Gamepad", _XInputGamepad)]
+
+
+def _load_xinput() -> ctypes.CDLL | None:
+    for name in ("XInput1_4", "XInput1_3", "XInput9_1_0"):
+        try:
+            return ctypes.windll.LoadLibrary(name)
+        except OSError:
+            continue
+    return None
 
 
 def probe() -> int:
@@ -54,13 +77,7 @@ def probe() -> int:
     pad = ViGEmXboxAdapter()
     time.sleep(0.5)  # the driver needs a moment to enumerate the new device
     try:
-        xinput = None
-        for name in ("XInput1_4", "XInput1_3", "XInput9_1_0"):
-            try:
-                xinput = ctypes.windll.LoadLibrary(name)
-                break
-            except OSError:
-                continue
+        xinput = _load_xinput()
         if xinput is None:
             print("could not load any XInput DLL")
             return 1
@@ -133,6 +150,59 @@ def _run(
     return 0
 
 
+def readback() -> int:
+    """Drive the stick and read the pad's real state back out of Windows.
+
+    This exists to end an argument that would otherwise cost hours: when a game does not
+    respond, is our pad failing to move, or is the game ignoring a pad that is moving fine?
+    Asking XInput what the device is actually reporting answers that with evidence instead
+    of theories, and needs no game running at all.
+    """
+    from player2.control.vigem import ViGEmXboxAdapter
+
+    xinput = _load_xinput()
+    if xinput is None:
+        print("could not load any XInput DLL")
+        return 1
+
+    output = ViGEmXboxAdapter()
+    time.sleep(0.5)
+    scheduler = Scheduler(output=output, clock=SessionClock(), max_hold_ms=3000.0)
+    thread = SchedulerThread(scheduler)
+    thread.start()
+    observed: list[tuple[int, int]] = []
+    try:
+        for seq, (label, vector) in enumerate(DIRECTIONS.items()):
+            scheduler.submit(ActionChunk(
+                keyframes=(
+                    Keyframe(t_ms=0.0, left_stick=vector),
+                    Keyframe(t_ms=600.0, left_stick=vector),
+                ),
+                decision_seq=seq,
+            ))
+            time.sleep(0.3)
+            state = _XInputState()
+            if xinput.XInputGetState(0, ctypes.byref(state)) != 0:
+                print("  slot 0 reported no device")
+                continue
+            pad = state.Gamepad
+            observed.append((pad.sThumbLX, pad.sThumbLY))
+            print(f"  commanded {label:<5} {str(vector):<12} "
+                  f"XInput reports LX={pad.sThumbLX:>7} LY={pad.sThumbLY:>7}")
+            time.sleep(0.3)
+    finally:
+        thread.stop()
+
+    moved = [pair for pair in observed if max(abs(pair[0]), abs(pair[1])) > 16000]
+    if len(moved) == len(DIRECTIONS):
+        print("\nAll four directions registered at full deflection.")
+        print("The virtual pad is working. If a game does not respond, the game is either")
+        print("paused, showing a menu that swallows movement, or not in controller mode.")
+        return 0
+    print(f"\nOnly {len(moved)}/{len(DIRECTIONS)} directions registered -- this IS our bug.")
+    return 1
+
+
 def _wrap_chunk(profile_path: str | None) -> ActionChunk | None:
     """Load the profile's nominated wrap macro, if a profile was supplied."""
     if not profile_path:
@@ -143,6 +213,14 @@ def _wrap_chunk(profile_path: str | None) -> ActionChunk | None:
               file=sys.stderr)
         return None
     print(f"wrapping with macro '{profile.wrap_macro}' from profile '{profile.name}'")
+    # A wrap macro is a TOGGLE, and the runtime is currently blind -- it has no way to see
+    # what state the game is in, so it cannot know which way a toggle will flip. Get this
+    # backwards and the "pause around the test" becomes "run the whole test paused", which
+    # looks exactly like a broken controller. This goes away once capture lands and the
+    # agent can see the screen; until then, say it out loud.
+    print("  NOTE: this macro is a toggle and the runtime cannot see game state.")
+    print("  It assumes the game is currently PAUSED. If it is running, this will pause it")
+    print("  and the sequence will execute against a frozen game.")
     return profile.get_macro(profile.wrap_macro)
 
 
@@ -183,7 +261,8 @@ def macro(profile_path: str, name: str, dry_run: bool, delay: float = 0.0) -> in
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["probe", "square", "deadman", "macro"])
+    parser.add_argument("command",
+                        choices=["probe", "readback", "square", "deadman", "macro"])
     parser.add_argument("--seconds", type=float, default=1.0, help="seconds per side")
     parser.add_argument("--dry-run", action="store_true",
                         help="use the null adapter; creates no virtual device")
@@ -199,6 +278,8 @@ def main(argv: list[str] | None = None) -> int:
     delay = 0.0 if args.dry_run else args.delay
     if args.command == "probe":
         return probe()
+    if args.command == "readback":
+        return readback()
     if args.command == "macro":
         if not args.profile or not args.name:
             parser.error("macro requires --profile and --name")
