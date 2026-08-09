@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "player2"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["vgamepad", "windows-capture", "mss"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "mypy"]
+# Voice is strictly opt-in. Nothing in the core runtime imports player2.audio,
+# so a machine that never installs this group pays nothing for it -- no model
+# weights, no audio backends, no import cost. Install with: pip install -e .[voice]
+voice = ["faster-whisper", "piper-tts", "sounddevice"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
