@@ -71,7 +71,7 @@ def probe() -> int:
         pad.reset()
 
 
-def _run(chunks: list[ActionChunk], *, dry_run: bool) -> int:
+def _run(chunks: list[ActionChunk], *, dry_run: bool, delay: float = 0.0) -> int:
     """Submit chunks in order, letting each play out before the next is offered."""
     if dry_run:
         output: object = NullControllerAdapter()
@@ -79,6 +79,12 @@ def _run(chunks: list[ActionChunk], *, dry_run: bool) -> int:
         from player2.control.vigem import ViGEmXboxAdapter
 
         output = ViGEmXboxAdapter()
+
+    # The virtual pad reaches whichever window has focus, so give the human time to click
+    # back into the game before anything starts moving.
+    for remaining in range(int(delay), 0, -1):
+        print(f"  focus the game... {remaining}", flush=True)
+        time.sleep(1.0)
 
     scheduler = Scheduler(output=output, clock=SessionClock(), max_hold_ms=250.0)  # type: ignore[arg-type]
     thread = SchedulerThread(scheduler)
@@ -102,7 +108,7 @@ def _run(chunks: list[ActionChunk], *, dry_run: bool) -> int:
     return 0
 
 
-def square(seconds_per_side: float, dry_run: bool) -> int:
+def square(seconds_per_side: float, dry_run: bool, delay: float = 0.0) -> int:
     """Walk a square. Four sides, one chunk each, held for the full side."""
     ms = seconds_per_side * 1000.0
     chunks = [
@@ -115,10 +121,10 @@ def square(seconds_per_side: float, dry_run: bool) -> int:
         )
         for i, vector in enumerate(DIRECTIONS.values())
     ]
-    return _run(chunks, dry_run=dry_run)
+    return _run(chunks, dry_run=dry_run, delay=delay)
 
 
-def deadman(dry_run: bool) -> int:
+def deadman(dry_run: bool, delay: float = 0.0) -> int:
     """Hold forward once, then stop talking. Proves silence means stop."""
     chunk = ActionChunk(
         keyframes=(
@@ -126,7 +132,7 @@ def deadman(dry_run: bool) -> int:
             Keyframe(t_ms=500.0, left_stick=(0.0, 1.0)),
         )
     )
-    return _run([chunk], dry_run=dry_run)
+    return _run([chunk], dry_run=dry_run, delay=delay)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -135,13 +141,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--seconds", type=float, default=1.0, help="seconds per side")
     parser.add_argument("--dry-run", action="store_true",
                         help="use the null adapter; creates no virtual device")
+    parser.add_argument("--delay", type=float, default=5.0,
+                        help="seconds to wait before moving, so you can focus the game")
     args = parser.parse_args(argv)
 
+    delay = 0.0 if args.dry_run else args.delay
     if args.command == "probe":
         return probe()
     if args.command == "square":
-        return square(args.seconds, args.dry_run)
-    return deadman(args.dry_run)
+        return square(args.seconds, args.dry_run, delay)
+    return deadman(args.dry_run, delay)
 
 
 if __name__ == "__main__":
