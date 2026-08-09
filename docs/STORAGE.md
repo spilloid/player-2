@@ -23,6 +23,50 @@ diagnostic* — 95 frames collapsing to 13 unique images is the system telling y
 happened during that recording. We had captured a paused game twice without noticing until
 the hash said so.
 
+## Live gameplay, measured — and it deflates most of the above
+
+45 seconds of the agent walking an expanding spiral through real terrain:
+
+| | Paused session | **Live gameplay** |
+|---|---|---|
+| Unique frames | 13 / 95 (14%) | **266 / 266 (100%)** |
+| Adjacent perceptual distance | 0 (p50, p90, max) | **p50 9, p90 14, max 19** |
+
+**De-duplication saves nothing on live gameplay.** Every frame differs. The 93% figure was
+entirely an artefact of recording a paused game. Dedup remains worth having — it makes the
+idle case free and the ratio is a genuine did-anything-happen diagnostic — but it is not a
+storage strategy for real play. Segmented video still is.
+
+The change gate is similarly deflated, and the honest version is:
+
+| Threshold | Frames passing |
+|---|---|
+| 8 | 70% |
+| 10 | 58% |
+| 16 | 39% |
+| 24 | 21% |
+
+A 2–5x reduction, not the 200x the paused measurement implied. Note also that the maximum
+adjacent distance over the whole session was 19 out of 64 bits, so the useful threshold band
+is roughly 8–16; anything above ~20 never fires at all.
+
+### The lever is decision cadence, not frame count
+
+The gate figures above are per *frame*, which is the wrong denominator. Frames arrive at
+~30fps; the loop decides every 700ms. Over 45 seconds that is about **64 decisions**, not 274.
+Cost follows the decisions:
+
+| Configuration | 45s of play | Per minute |
+|---|---|---|
+| `codex exec`, decide every 700ms | ~800k tokens | ~1.07M |
+| Direct SDK, decide every 700ms | ~77k | ~103k |
+| Direct SDK + gate at 16 | ~30k | ~40k |
+| Direct SDK + gate at 16 + 1.5s cadence | ~14k | ~19k |
+
+So the ordering of wins is: **transport (10x) > cadence (2x) > gate (2.5x)**, and they
+multiply. The gate is real but it is the smallest of the three, which is worth knowing before
+building anything clever on top of it.
+
 ## The same hash is also the spend gate
 
 `content_hash` de-duplicates storage; `perceptual_hash` answers "has anything changed?" for
@@ -123,6 +167,20 @@ So an encoded artifact keyed by `(seq, format, max_dim)` can be cached in a smal
 and handed to both consumers. Bounded, because an unbounded cache in the process that owns the
 runtime's eyes is a slow memory leak that ends with the OOM killer taking out the thing that
 holds the controller.
+
+## Open defect: the recorder only sees what the agent looked at
+
+The same live run captured **1,170 frames and recorded 266** — about 23%. The recorder is fed
+by `AgentLoop._record_new_frames`, which forwards whatever the loop happened to poll, so the
+dataset contains the agent's *sampling* of the screen rather than the screen.
+
+For "what did the model see when it decided" that is arguably correct. For a demonstration
+dataset meant to train a motor policy, losing three quarters of the visual timeline is not.
+The fix is for the recorder to pump the video source itself on its own cadence, independent of
+the decision loop — at which point the leading/trailing gap findings from the review get
+resolved by the same change, since the recorder would own the frame stream end to end.
+
+Filed rather than fixed, because it changes who owns frame delivery and deserves its own unit.
 
 ## Order of work
 

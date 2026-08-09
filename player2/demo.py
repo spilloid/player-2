@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import math
 import sys
 import time
 from dataclasses import replace
@@ -282,7 +283,30 @@ def capture(profile_path: str | None, count: int, out_dir: str, delay: float) ->
     return 0
 
 
-def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str) -> int:
+def spiral_chunks(segments: int = 28, base_ms: float = 700.0,
+                  growth_ms: float = 55.0) -> list[ActionChunk]:
+    """Walk an expanding spiral: heading rotates, each leg a little longer than the last.
+
+    Deliberately not a square. A square retraces the same few headings and revisits ground
+    it has already seen, which produces a recording full of near-duplicate frames -- the
+    exact thing that made the earlier sessions collapse to a handful of unique images. A
+    spiral keeps the camera moving over new terrain, so the footage is actually worth
+    something as demonstration data.
+    """
+    chunks = []
+    for i in range(segments):
+        angle = i * (math.tau / 8.0)  # eight headings per revolution
+        vector = (round(math.cos(angle), 3), round(math.sin(angle), 3))
+        duration = base_ms + i * growth_ms
+        chunks.append(ActionChunk(keyframes=(
+            Keyframe(t_ms=0.0, left_stick=vector),
+            Keyframe(t_ms=duration, left_stick=vector),
+        )))
+    return chunks
+
+
+def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
+          pattern: str = "square", warmup: str | None = None) -> int:
     """The whole loop, end to end: see the game, decide, act, and record all of it.
 
     Capture -> policy -> action chunk -> scheduler -> virtual pad -> game, with every frame,
@@ -334,17 +358,30 @@ def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str) 
     scheduler = Scheduler(output=output, clock=clock, max_hold_ms=250.0)
     sched_thread = SchedulerThread(scheduler)
 
-    policy = ScriptedPolicy([
-        ActionChunk(keyframes=(Keyframe(t_ms=0.0, left_stick=v), Keyframe(t_ms=800.0)))
-        for v in DIRECTIONS.values()
-    ])
-    loop = AgentLoop(policy=policy, video=video, scheduler=scheduler, clock=clock,
-                     goal="walk in a square", recorder=recorder, min_interval_ms=800.0)
+    if pattern == "spiral":
+        chunks = spiral_chunks()
+        goal, interval = "walk an expanding spiral over new ground", 700.0
+    else:
+        chunks = [
+            ActionChunk(keyframes=(Keyframe(t_ms=0.0, left_stick=v), Keyframe(t_ms=800.0)))
+            for v in DIRECTIONS.values()
+        ]
+        goal, interval = "walk in a square", 800.0
+    loop = AgentLoop(policy=ScriptedPolicy(chunks), video=video, scheduler=scheduler,
+                     clock=clock, goal=goal, recorder=recorder, min_interval_ms=interval)
 
     sched_thread.start()
-    loop.start()
     try:
         focus_window(target.hwnd)
+        # Run any warm-up macro INSIDE this pad connection, before the loop starts. Doing it
+        # as a separate one-shot command creates and destroys a controller, and a game that
+        # pauses on controller disconnect will simply undo whatever the macro achieved.
+        if warmup and profile is not None:
+            time.sleep(0.4)
+            if scheduler.submit(replace(profile.get_macro(warmup), decision_seq=1)):
+                print(f"warm-up macro '{warmup}' submitted")
+                time.sleep(profile.get_macro(warmup).duration_ms / 1000.0 + 0.5)
+        loop.start()
         time.sleep(seconds)
     finally:
         loop.stop()
@@ -610,6 +647,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default="captures", help="output directory for 'capture'")
     parser.add_argument("--recordings", default="recordings",
                         help="session root directory for 'agent'")
+    parser.add_argument("--pattern", choices=["square", "spiral"], default="square",
+                        help="movement pattern for 'agent'")
+    parser.add_argument("--warmup", default=None,
+                        help="macro to replay once before the loop starts, same pad session")
     parser.add_argument("--direction", choices=sorted(DIRECTIONS), default="right",
                         help="direction for the 'hold' command")
     parser.add_argument("--seconds", type=float, default=1.0, help="seconds per side")
@@ -632,7 +673,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "capture":
         return capture(args.profile, args.frames, args.out, delay)
     if args.command == "agent":
-        return agent(args.profile, args.seconds, delay, args.recordings)
+        return agent(args.profile, args.seconds, delay, args.recordings, args.pattern,
+                     args.warmup)
     if args.command == "replay":
         if not args.session:
             parser.error("replay requires --session")

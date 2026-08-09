@@ -35,6 +35,25 @@ keyframes = [
   { t_ms = 220, buttons = [], right_trigger = 0.0 },
 ]
 
+# Closing an open menu. Discovered the hard way: two "live" recordings turned out to be a
+# paused game sitting behind the Game menu, which the pause toggle cannot clear. From
+# config.ini: confirm-gui-controller = controller-y.
+[macros.menu_back]
+keyframes = [
+  { t_ms = 0,   buttons = [] },
+  { t_ms = 40,  buttons = ["B"] },
+  { t_ms = 140, buttons = ["B"] },
+  { t_ms = 180, buttons = [] },
+]
+
+[macros.menu_confirm]
+keyframes = [
+  { t_ms = 0,   buttons = [] },
+  { t_ms = 40,  buttons = ["Y"] },
+  { t_ms = 140, buttons = ["Y"] },
+  { t_ms = 180, buttons = [] },
+]
+
 # Opens the character/inventory screen; useful as a harmless "did anything happen at all"
 # probe that does not move the character or touch the world.
 [macros.open_character]
