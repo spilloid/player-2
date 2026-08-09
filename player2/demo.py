@@ -37,6 +37,7 @@ from player2.contracts import ActionChunk, Keyframe
 from player2.control.null import NullControllerAdapter
 from player2.control.scheduler import Scheduler, SchedulerThread
 from player2.profile import load_profile
+from player2.window import WindowInfo, current_foreground, find_window, focus_window
 
 # Cardinal directions as left-stick positions. +y is up, matching XInput.
 DIRECTIONS: dict[str, tuple[float, float]] = {
@@ -231,9 +232,25 @@ SESSION_HELP = """commands:
   square [seconds]                     walk a square
   macro <name>                         replay a named macro from --profile
   macros                               list macros in the loaded profile
+  window                               re-resolve the game window
   events                               print buffered scheduler events
   help | quit
 """
+
+# Windows needs a moment to actually complete a foreground change before input lands in
+# the newly raised window. Too short and the first part of a chunk goes to the terminal.
+FOCUS_SETTLE_S = 0.25
+
+
+def _resolve_window(needle: str | None) -> WindowInfo | None:
+    if not needle:
+        return None
+    found = find_window(needle)
+    if found is None:
+        print(f"  no window matching '{needle}' -- is the game running?")
+    else:
+        print(f"  game window: '{found.title}' (hwnd {found.hwnd})")
+    return found
 
 
 def session(profile_path: str | None) -> int:
@@ -257,6 +274,9 @@ def session(profile_path: str | None) -> int:
     thread.start()
     seq = 0
     print("virtual pad connected and STAYING connected until you quit.")
+    game = _resolve_window(profile.window_title_contains if profile else None)
+    if game is None:
+        print("  no game window: you will have to alt-tab yourself before each command")
     print(SESSION_HELP)
     try:
         while True:
@@ -278,6 +298,9 @@ def session(profile_path: str | None) -> int:
                 continue
             if cmd == "macros":
                 print("  " + (", ".join(sorted(profile.macros)) if profile else "no --profile"))
+                continue
+            if cmd == "window":
+                game = _resolve_window(profile.window_title_contains if profile else None)
                 continue
 
             pending: list[ActionChunk] = []
@@ -307,12 +330,25 @@ def session(profile_path: str | None) -> int:
                 print(f"  unknown command '{cmd}'")
                 continue
 
-            for chunk in pending:
-                seq += 1
-                if scheduler.submit(replace(chunk, decision_seq=seq)):
-                    time.sleep(chunk.duration_ms / 1000.0)
+            # Raise the game, run the sequence, then hand focus back so the next command
+            # can be typed straight away. Without this the human has to alt-tab faster
+            # than the first chunk, which is not a design so much as a reflex test.
+            terminal = current_foreground()
+            if game is not None:
+                if focus_window(game.hwnd):
+                    time.sleep(FOCUS_SETTLE_S)
                 else:
-                    print(f"  chunk seq={seq} REJECTED")
+                    print("  could not focus the game window; input may go elsewhere")
+            try:
+                for chunk in pending:
+                    seq += 1
+                    if scheduler.submit(replace(chunk, decision_seq=seq)):
+                        time.sleep(chunk.duration_ms / 1000.0)
+                    else:
+                        print(f"  chunk seq={seq} REJECTED")
+            finally:
+                if game is not None and terminal:
+                    focus_window(terminal)
     finally:
         thread.stop()
         print("pad released and disconnected")
