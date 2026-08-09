@@ -63,7 +63,49 @@ for that separately; do not expect a reviewer to supply it.
 
 ## Findings
 
-_Provisional after 2 units. Do not trust these yet; first real revision after Unit 5._
+_Revised after 7 units. Backed by our own measurements; delete any rule the data stops
+supporting._
+
+### Routing, as the numbers actually support it
+
+- **Luna is viable for tightly-specified work and genuinely cheap.** Given tests as the spec it
+  passed 93/94 on a first attempt at 32k tokens, and it caught a real bug in Claude's tests.
+  It has never once modified a test it was told not to touch.
+- **Luna does not think adversarially about its own output**, and cannot verify work it cannot
+  run — its sandbox has no desktop, so every window test failed there and passed here. It
+  reported that accurately rather than claiming success. **Never ship Luna output unreviewed;
+  never delegate OS-integration verification to it.**
+- **Terra/high is a solid implementer and a weak reviewer of its own domain.** It wrote the
+  scheduler and the capture layer and was blind to its own lock discipline in both.
+- **Sol/high is worth its cost on anything with threads, lifetimes, or a resource that must be
+  released.** Four criticals in Terra output twice, eleven criticals in Sol/ultra output once,
+  every time invisible to a fully green suite. **Rule: threads, locks, shutdown ordering, or a
+  released resource ⇒ Sol/high review regardless of diff size.**
+- **Sol/ultra is a strong implementer of large multi-file units and is not a substitute for
+  review.** One pass produced six coherent modules across two packages, green and clean — and
+  a separate Sol/high pass still found 15 defects in it. Ultra reduces the number of rounds,
+  not the need for them.
+
+### About the process itself
+
+- **A green suite is evidence about the tests, not the code.** Unit 2 passed 194/194 with
+  strict types and clean lint and still contained four criticals that could strand a held
+  controller. Tests written by the same mind that specified the design encode the same blind
+  spots.
+- **Claude's tests are the least-reviewed and most load-bearing artifact here.** Four broken
+  ones caught so far — three by a reviewer, one by an implementer hitting a fixture that
+  raised before reaching the code under test. Ask reviewers to grade the tests explicitly.
+- **The most valuable review finding may not be a defect.** Sol's best contribution in Unit 4
+  was noticing that none of its other twelve findings were reachable by any test. The fix was
+  a seam, not a patch.
+- **Review reads diffs, so it finds defects that live in diffs.** The three worst bugs of the
+  project so far did not: a controller unplugged on process exit, a focus check that reported
+  failure for every success, and 1.8GB of frames per twelve seconds. All three were found by
+  running the real system. **Budget for that separately; a reviewer cannot supply it.**
+- **A review finding can be right about the problem and wrong about the fix.** Adjudicate the
+  *problem*, then choose the fix yourself. Several fixes here differ from what was proposed.
+- **When a reviewer indicts the spec rather than the code, believe it.** The worst defect in
+  Units 5+6 was Claude's design decision, faithfully implemented.
 
 - **Luna is sufficient to implement a tightly test-specified module, and cheap.** Given 94 tests
   as the spec, Luna/medium passed 93 on the first attempt at 32k tokens. Both Unit 0 and Unit 1
@@ -128,6 +170,43 @@ _Provisional after 2 units. Do not trust these yet; first real revision after Un
 | 2 | Motor system: IControllerOutput, null + ViGEm adapters, tick-driven Scheduler, SchedulerThread | Terra/high | **Sol/high** | 10 (9 Sol + 1 Claude) | 9 | **0** | 147,098 (912s across 3 calls) | See notes below. The headline: 194 passing tests found **none** of the 9 defects. |
 
 | 4 | Eyes: IVideoSource, FrameRing, fake source, Windows Graphics Capture backend | Terra/high | **Sol/high** | 14 (13 Sol + 1 Terra, in Claude's tests) | 13 | 0 | ~205,000 (1,350s across 3 calls) | See notes below. Sol's most valuable finding was not a defect at all. |
+
+| 5+6 | Recorder + agent seam + shared frame encoding (6 files, 2 packages) | **Sol/ultra** | **Sol/high** | 17 (15 Sol + 2 from live runs) | 17 | 0 | ~480,000 (~2,900s across 4 calls) | First use of ultra. Produced a large, coherent, working implementation in one pass — and still needed 15 defects fixed. |
+
+### Units 5+6 detail — the first ultra run, and a design error of Claude's
+
+Combined at Joey's suggestion, correctly: the recorder writes frames to disk and the agent
+hands frames to a model, and those are the same operation. Building them separately would have
+guaranteed the two drift.
+
+Claude wrote 64 tests as the spec. **Sol/ultra** implemented all six modules across two
+packages in a single pass — 360 tests green, `mypy --strict` and `ruff` clean. As an
+implementer of a large, well-specified, multi-file unit it was genuinely impressive: coherent
+design, house style matched, no scope creep.
+
+**Sol/high review then found 15 defects, 11 critical** (91,148 tok). All accepted; 13 fixed,
+2 recorded as deliberate known limitations rather than half-fixed (no `fsync` durability
+against host power loss; recorder admission takes a short lock, so "non-blocking" means
+bounded rather than lock-free).
+
+**The most important finding was a design error of Claude's, not Sol/ultra's.** Claude decided
+the agent loop should be the sole drainer of scheduler events — correctly, since
+`drain_events()` clears as it reads and two consumers would each get half. But the loop also
+called `policy.propose()` on that same thread. So a hung model silently stopped takeovers,
+deadman fires and rejections from ever reaching the recorder; they accumulated in a bounded
+deque and the oldest were overwritten unseen. **The witness had been coupled to the slowest
+component in the system.** Sol/ultra implemented the specified design faithfully; the spec was
+wrong.
+
+Two further defects came from **running the thing**, not from any review:
+
+- A 12-second session wrote **1.8GB** of lossless PNG — 540GB/hour. The fix turned out to be
+  principled rather than merely pragmatic: the model is handed downscaled JPEG, so lossless
+  full-resolution frames record something the policy never saw. Same run now costs 43.6MB, a
+  41x reduction, *and* is a better dataset.
+- `frames_dropped` counts ring evictions, not frames lost to the consumer. A live run reported
+  219 "dropped" while recording 281 of 283 frames with zero gaps. A metric whose name implies
+  damage that did not occur is its own kind of corruption.
 
 ### Unit 4 detail — when the reviewer indicts the test strategy
 
