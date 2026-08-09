@@ -73,6 +73,24 @@ class TestFocus:
         assert focus_window(0) is False
         assert focus_window(-1) is False
 
-    def test_focusing_a_real_window_reports_a_bool(self) -> None:
-        result = focus_window(list_windows()[0].hwnd)
-        assert isinstance(result, bool)
+    def test_focusing_the_already_focused_window_succeeds(self) -> None:
+        """Replaces an earlier test that only asserted the return was a bool -- which is
+        to say, a test that could not fail for the reason it claimed to check. It passed
+        happily while focus_window() returned False for every successful focus change.
+
+        SetForegroundWindow completes asynchronously, so reading GetForegroundWindow back
+        immediately catches the OLD window and reports failure for a change that is about
+        to succeed. The verification has to wait for the change to land.
+
+        Focusing whatever is already focused is the one case with no race in it, so it is
+        the sharpest available assertion that does not depend on the desktop's state."""
+        hwnd = current_foreground()
+        if hwnd == 0:
+            pytest.skip("no foreground window in this session")
+        assert focus_window(hwnd) is True
+
+    def test_focus_reports_true_only_when_the_window_really_is_foreground(self) -> None:
+        hwnd = current_foreground()
+        if hwnd == 0:
+            pytest.skip("no foreground window in this session")
+        assert focus_window(hwnd) is (current_foreground() == hwnd)

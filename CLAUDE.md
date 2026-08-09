@@ -121,6 +121,17 @@ and where it breaks, so the cost offset is measured rather than assumed.
 Tests pass, review round logged, `DEV-PROCESS.md` updated, diff is one coherent commit whose
 message explains **why**.
 
+## Before debugging a game-integration failure
+
+Read [docs/PLATFORM-NOTES.md](docs/PLATFORM-NOTES.md) first. It lists the Windows and game
+boundaries that produce symptoms indistinguishable from bugs in our own code — controller
+hot-unplug pausing the game, focus stealing, `SetForegroundWindow` lying in two different
+directions, input-method modes — along with the diagnostic that settles each one. Several
+hours have already been spent rediscovering entries in that file.
+
+The general rule it encodes: **when an integration fails, read the other system's logs before
+touching your own code.**
+
 ## Commands
 
 ```powershell
