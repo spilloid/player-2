@@ -114,7 +114,9 @@ difference between a teammate and a character sprinting into a lake.
 
 | Document | What it's for |
 |---|---|
+| [docs/CARRYOVER.md](docs/CARRYOVER.md) | **Start here.** Full project state, written to be read cold |
 | [CLAUDE.md](CLAUDE.md) | Working agreement: roles, routing, review protocol |
+| [docs/STORAGE.md](docs/STORAGE.md) | Frame storage and inference-cost measurements, and where both go next |
 | [docs/PLATFORM-NOTES.md](docs/PLATFORM-NOTES.md) | Windows and game-integration gotchas, and the diagnostics that resolve them |
 | [docs/DEV-PROCESS.md](docs/DEV-PROCESS.md) | Every review round, measured — a routing policy derived from our own numbers |
 
