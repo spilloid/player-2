@@ -20,6 +20,7 @@ from player2.contracts import NEUTRAL, ActionChunk, Frame, PadState, chunk_to_di
 from player2.control.base import IControllerOutput
 from player2.record.manifest import build_manifest, empty_counts, write_manifest
 from player2.video.encode import downscale, encode_jpeg, encode_png
+from player2.video.fingerprint import content_hash
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,8 @@ class SessionRecorder:
     a held input, while waiting in a capture callback can create further invisible frame loss.
     Frames default to downscaled JPEG because the policy observes that compact image, while
     lossless full-resolution PNG would preserve discarded detail at an unusable data volume.
+    Repeated observations retain their separate timeline rows while sharing pixels, so an
+    idle screen cannot turn a useful session into an unbounded pile of identical images.
     """
 
     _STREAM_NAMES = ("pad.jsonl", "chunks.jsonl", "events.jsonl", "frames.jsonl")
@@ -92,6 +95,7 @@ class SessionRecorder:
         frame_format: str = "jpeg",
         frame_max_dim: int | None = 1280,
         jpeg_quality: int = 85,
+        deduplicate: bool = True,
     ) -> None:
         """Prepare one-shot session state without touching disk before ``start``.
 
@@ -112,6 +116,8 @@ class SessionRecorder:
             raise ValueError("jpeg_quality must be an integer from 1 through 100")
         if not 1 <= jpeg_quality <= 100:
             raise ValueError("jpeg_quality must be an integer from 1 through 100")
+        if not isinstance(deduplicate, bool):
+            raise ValueError("deduplicate must be a boolean")
         self._root = Path(root)
         self._clock = clock
         self._metadata_source = metadata
@@ -119,10 +125,12 @@ class SessionRecorder:
         self._frame_format = frame_format
         self._frame_max_dim = frame_max_dim
         self._jpeg_quality = jpeg_quality
+        self._deduplicate = deduplicate
         self._session_id = uuid4().hex
         self._directory = self._root / self._session_id
         self._queue: queue.Queue[_Record] = queue.Queue(maxsize=queue_size)
         self._counts = empty_counts()
+        self._counts["frames_unique"] = 0
         self._counts_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._stop_lock = threading.Lock()
@@ -182,6 +190,7 @@ class SessionRecorder:
                         "max_dim": self._frame_max_dim,
                         "jpeg_quality": self._jpeg_quality,
                     },
+                    counts=self._counts,
                 )
                 write_manifest(self._directory / "manifest.json", manifest)
             except BaseException:
@@ -322,6 +331,7 @@ class SessionRecorder:
     ) -> None:
         """Drain through shutdown so accepted rows are not discarded by an orderly stop."""
         last_frame_seq: int | None = None
+        frame_paths: dict[str, str] = {}
         records_since_checkpoint = 0
         checkpoint_at = time.monotonic() + _CHECKPOINT_SECONDS
         while True:
@@ -347,6 +357,7 @@ class SessionRecorder:
                         events,
                         record.frame,
                         last_frame_seq,
+                        frame_paths,
                     )
             except Exception:
                 self._drop_record(record)
@@ -398,27 +409,37 @@ class SessionRecorder:
         events: TextIO,
         frame: Frame,
         previous_seq: int | None,
+        frame_paths: dict[str, str],
     ) -> int:
         """Write pixels before their index and explicitly label every sequence discontinuity.
 
         Indexing first could leave a crash-time row pointing at a partial image; comparing
         persisted frames also exposes queue drops instead of only gaps seen by the producer.
+        Reusing prior paths retains every observation without repeating idle-screen storage.
         """
+        frame_hash = content_hash(frame)
         stored = (
             downscale(frame, self._frame_max_dim)
             if self._frame_max_dim is not None
             else frame
         )
         extension = ".jpg" if self._frame_format == "jpeg" else ".png"
-        relative_path = Path("frames") / f"{frame.seq:012d}{extension}"
-        destination = self._directory / relative_path
-        temporary = destination.with_suffix(f"{extension}.tmp")
-        if self._frame_format == "jpeg":
-            encoded = encode_jpeg(stored, quality=self._jpeg_quality)
+        existing_path = frame_paths.get(frame_hash)
+        if self._deduplicate and existing_path is not None:
+            relative_path = Path(existing_path)
         else:
-            encoded = encode_png(stored)
-        temporary.write_bytes(encoded)
-        temporary.replace(destination)
+            relative_path = Path("frames") / f"{frame.seq:012d}{extension}"
+            destination = self._directory / relative_path
+            temporary = destination.with_suffix(f"{extension}.tmp")
+            if self._frame_format == "jpeg":
+                encoded = encode_jpeg(stored, quality=self._jpeg_quality)
+            else:
+                encoded = encode_png(stored)
+            temporary.write_bytes(encoded)
+            temporary.replace(destination)
+        if existing_path is None:
+            frame_paths[frame_hash] = relative_path.as_posix()
+            self._increment("frames_unique")
         if previous_seq is None and frame.seq > 0:
             detail = f"missing frame seq 0-{frame.seq - 1}"
             self._write_event(events, _EventRecord("frame_gap", frame.session_ms, detail))
@@ -440,6 +461,7 @@ class SessionRecorder:
                 "capture_width": frame.width,
                 "capture_height": frame.height,
                 "path": relative_path.as_posix(),
+                "content_hash": frame_hash,
             },
         )
         self._increment("frames")

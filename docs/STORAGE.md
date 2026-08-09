@@ -5,15 +5,58 @@ they change the shape of the dataset rather than just its size.
 
 ## Where we are
 
-| Encoding | Per frame | 1 hour of play |
-|---|---|---|
-| Lossless PNG, full resolution (first attempt) | ~6.5 MB | ~540 GB |
-| Downscaled JPEG (current default) | ~207 KB | ~16 GB |
+Measured on comparable ~10 second live sessions:
 
-The current default is not merely cheaper, it is more correct: the model is handed downscaled
+| Stage | Session size | Per frame |
+|---|---|---|
+| Lossless PNG, full resolution (first attempt) | 1.8 GB | ~6.5 MB |
+| Downscaled JPEG (default since) | 43.6 MB | ~207 KB |
+| Content-hash de-duplication | **2.7 MB** | 13 unique images for 95 frames |
+
+The JPEG default is not merely cheaper, it is more correct: the model is handed downscaled
 JPEG, so storing lossless full-resolution frames records something the policy never saw.
 
-16 GB/hour is still too much to keep casually.
+**Caveat on the dedup number.** That session had the game paused behind a menu, so it is the
+best case rather than the typical one. Real gameplay will dedupe far less. Two things hold
+regardless: the pathological case now costs almost nothing, and the *ratio itself is a
+diagnostic* — 95 frames collapsing to 13 unique images is the system telling you nothing
+happened during that recording. We had captured a paused game twice without noticing until
+the hash said so.
+
+## The same hash is also the spend gate
+
+`content_hash` de-duplicates storage; `perceptual_hash` answers "has anything changed?" for
+about 0.1ms and zero tokens. That second question is worth real money: a measured remote
+decision through `codex exec` costs **~12,500 tokens** (see the transport note below), so a
+static screen that triggers a decision every frame is pure waste.
+
+On the paused session, gating decisions on perceptual change took 215 potential decisions
+down to 1 — roughly 2,688k tokens down to 12k. Again a best case, and again the point stands:
+the runtime should never pay to be told that nothing moved.
+
+One mechanism, two consumers, which is why it was built as its own module rather than inside
+either of them.
+
+## Transport, measured
+
+Before optimising what we send, it was worth measuring what it costs to send anything.
+Luna via `codex exec`, one action-chunk decision, structured output:
+
+| Input | Latency | Tokens |
+|---|---|---|
+| no image, one-line prompt | 6.5 s | **12,507** |
+| 384px frame | 4.9 s | 11,436 |
+| 768px frame | 6.7 s | 13,187 |
+| 1280px frame | 5.9 s | 12,817 |
+
+**The image is nearly free; the transport is not.** The ~12.5k floor is `codex exec` shipping
+a full coding-agent harness — system instructions, tool definitions, session scaffolding — on
+every invocation. One decision every two seconds would cost ~1.9M tokens for five minutes of
+play.
+
+The conclusion is not that the model is too expensive but that the *harness* is: a direct SDK
+call with a minimal prompt should be roughly 800–1,500 tokens including a small frame. That is
+a 10–15x reduction from changing transport alone, before the gate above is applied.
 
 ## 1. Store the differential, not the frame
 
@@ -83,7 +126,16 @@ holds the controller.
 
 ## Order of work
 
-1. Content-hash dedup — small, no dependencies, fixes the pathological case immediately.
-2. Shared encode cache — correctness win, makes the dataset provably match the model's input.
-3. Segmented hardware-accelerated video — the real 10x, and the point at which recording every
-   session by default stops being an imposition.
+1. ~~Content-hash dedup~~ — **done.** 43.6MB → 2.7MB on a paused session; ratio doubles as a
+   did-anything-happen diagnostic.
+2. ~~Shared encode cache~~ — **done.** `EncodeCache`, keyed on content rather than sequence
+   number, bounded LRU, thread-safe.
+3. ~~Perceptual-hash change gate~~ — **built**, not yet wired into the agent loop.
+4. Wire the gate into `AgentLoop` and measure the call-volume reduction on *live gameplay*
+   rather than on a paused screen.
+5. Direct SDK transport plus a **budget governor** — a tokens-per-minute cap that degrades
+   gracefully (longer chunk horizon, higher change threshold, fewer frames per observation,
+   and finally handing control back with an explicit event) rather than stopping dead. It
+   belongs conceptually next to the deadman: both are "fail safe when a resource runs out".
+6. Segmented hardware-accelerated video — the remaining 10x, and the point at which recording
+   every session by default stops being an imposition.

@@ -2,10 +2,64 @@
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
+from collections.abc import Callable
+
 import cv2  # type: ignore[import-untyped, unused-ignore]
 import numpy as np  # type: ignore[import-untyped, unused-ignore]
 
 from player2.contracts import Frame
+
+
+class EncodeCache:
+    """Share exact encoded bytes so recorded evidence is literally what the model saw.
+
+    Avoiding a second encode is a performance benefit, but the important property is that
+    the recorder and model cannot drift apart as codecs or quality settings evolve.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        """Bound retained byte strings so an idle runtime cannot leak memory indefinitely."""
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise ValueError("capacity must be a positive integer")
+        self._capacity = capacity
+        self._entries: OrderedDict[tuple[str, str, int | None], bytes] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(
+        self,
+        frame: Frame,
+        fmt: str,
+        max_dim: int | None,
+        encoder: Callable[[Frame], bytes],
+    ) -> bytes:
+        """Return cached bytes by pixel content while permitting duplicate work under races."""
+        # Import here because fingerprint reuses the conversion helpers in this module.
+        from player2.video.fingerprint import content_hash
+
+        key = (content_hash(frame), fmt, max_dim)
+        with self._lock:
+            cached = self._entries.pop(key, None)
+            if cached is not None:
+                self._entries[key] = cached
+                return cached
+
+        encoded = encoder(frame)
+        with self._lock:
+            cached = self._entries.pop(key, None)
+            if cached is not None:
+                self._entries[key] = cached
+                return cached
+            self._entries[key] = encoded
+            if len(self._entries) > self._capacity:
+                self._entries.popitem(last=False)
+            return encoded
+
+    def __len__(self) -> int:
+        """Report retained entries without exposing mutable cache internals to callers."""
+        with self._lock:
+            return len(self._entries)
 
 
 def _bgra_pixels(frame: Frame) -> np.ndarray:
