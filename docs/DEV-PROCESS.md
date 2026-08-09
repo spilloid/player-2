@@ -27,6 +27,18 @@ _Provisional after 2 units. Do not trust these yet; first real revision after Un
   ambiguity in what the pad does before a chunk's first keyframe and proposed changing `sample()`.
   The better fix was to legislate the ambiguity away: require the first keyframe at `t_ms=0`.
   Adjudication means judging the *problem*, then choosing the fix yourself.
+- **A green suite is evidence about the tests, not about the code.** Unit 2 passed 194/194 with
+  strict types and clean lint, and still contained four critical defects that could strand a held
+  controller. Tests written by the same mind that specified the design encode the same blind
+  spots. **Rule: a green suite does not retire the review round — on concurrency it barely
+  starts it.**
+- **Sol/high earns its cost on concurrency and lifecycle; Terra/high does not appear to.** Terra
+  wrote the scheduler and was blind to its own lock discipline. Sol found 4 criticals in it.
+  Provisional routing: **anything involving threads, locks, shutdown ordering, or a resource that
+  must be released goes to Sol/high for review, regardless of how small the diff is.**
+- **Ask the reviewer to grade the tests too.** Sol caught a test of Claude's that asserted after
+  ticking and therefore could not fail for the reason it claimed. Reviewers see faked tests that
+  their authors cannot.
 
 ## Routing
 
@@ -43,6 +55,49 @@ _Provisional after 2 units. Do not trust these yet; first real revision after Un
 | A | Architecture review (greenfield design, no code) | Claude | Sol/high | 20 | 13 now + 4 deferred | n/a (pre-code) | 10,828 (191s) | Worth it. Found a real safety bug: analog state surviving preemption when the next chunk omits it — the agent would hold a stick forever. Now invariant #2. 3 findings rejected/reframed: assumed asyncio starvation (already threaded), deadman self-hang (unfixable in-process, documented), `propose()` rewrite framing (concrete fix adopted, framing not). |
 | 0 | Scaffold (pyproject, packages, gitignore, DEV-PROCESS skeleton) | Luna/low | Claude | 0 | 0 | n/a | 8,618 (96s) | Luna followed a tight spec exactly — right structure, no invented content, no scope creep, obeyed all four "do not" instructions. Cheapest tier is sufficient for specced scaffolding. Open question: does that hold when the spec is behavioural rather than structural (Unit 1)? |
 | 1 | Pure-logic contracts: clock, PadState/Keyframe/ActionChunk/Frame, validate, resolve, sample, JSON codec | Luna/medium | Terra/high | 12 (11 Terra + 1 Claude) | 10 | 1 — but in *Claude's* tests, not Luna's code | 100,314 (565s across 3 calls) | See notes below. |
+
+| 2 | Motor system: IControllerOutput, null + ViGEm adapters, tick-driven Scheduler, SchedulerThread | Terra/high | **Sol/high** | 10 (9 Sol + 1 Claude) | 9 | **0** | 147,098 (912s across 3 calls) | See notes below. The headline: 194 passing tests found **none** of the 9 defects. |
+
+### Unit 2 detail — the most important data point so far
+
+Claude wrote 45 tests as the spec. Terra/high implemented against them (47,318 tok / 230s) and
+passed **194/194**, with `mypy --strict` and `ruff` clean. By every automated signal the unit was
+finished.
+
+Sol/high review (43,079 tok / 397s) then found **9 defects, 4 of them critical**, all sharing one
+failure mode: *the pad ends up stuck holding an input and nothing can release it.* In a live game
+that is not a hung process, it is a character sprinting into a lake while the model happily
+proposes new plans that never execute.
+
+The four criticals:
+1. **I/O under the lock.** `tick()` held the state lock across `output.set_state()`. A blocking
+   device driver would therefore also block `take_controller()`, `close()`, and even reading
+   `.epoch` — and `stop()` joins the wedged thread *before* attempting release. Every escape
+   route ran through the jam.
+2. **`take_controller()` never actually neutralised.** It mutated memory and waited for the next
+   tick. If the loop was late, stopped, or dead, the stick stayed down.
+3. **`close()` set `_closed = True` before the neutral write**, so a single failed write made
+   every subsequent `close()` a no-op and the pad was never released.
+4. **`except Exception` in the thread loop** missed `SystemExit`/`KeyboardInterrupt`, and release
+   was not in a `finally`.
+
+Plus: a start/stop race that could strand a running loop, a single-clock violation (the thread
+created its own `SessionClock`), a NaN clock silently disabling the deadman forever
+(`now > deadline` is False against NaN), unbounded event and pending queues, and `submit()`
+re-reading an untrusted `duration_ms` property after validation.
+
+**All 9 accepted**, two with different fixes than proposed. Claude contributed a 10th finding —
+a predicted self-deadlock in `submit()`'s failure path — which was **wrong**: `with` releases the
+lock via `__exit__` as the exception propagates, before the enclosing `except` runs. The test was
+kept as a regression guard, labelled as such, because the reasoning only holds for `with`.
+
+Sol also caught a **fake test of Claude's**: `test_neutralises_immediately` called `tick()` before
+asserting, so it only ever proved "neutral eventually" — and the implementation obligingly
+provided only that. A test that cannot fail for the reason it claims to check is worse than no
+test, because it consumes the budget of attention that a real test would have earned.
+
+Final: 210 tests, stable across 5 consecutive runs, `mypy --strict` and `ruff` clean. Virtual pad
+confirmed live on XInput slot 0.
 
 ### Unit 1 detail
 
