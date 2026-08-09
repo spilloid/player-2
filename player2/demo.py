@@ -282,6 +282,123 @@ def capture(profile_path: str | None, count: int, out_dir: str, delay: float) ->
     return 0
 
 
+def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str) -> int:
+    """The whole loop, end to end: see the game, decide, act, and record all of it.
+
+    Capture -> policy -> action chunk -> scheduler -> virtual pad -> game, with every frame,
+    every executed pad state, and every scheduler event written to a session directory on
+    one clock. The policy here is a scripted stand-in, but nothing else is: this is the
+    exact path a real model will run through.
+    """
+    from player2.agent.fast_stub import ScriptedPolicy
+    from player2.agent.loop import AgentLoop
+    from player2.control.vigem import ViGEmXboxAdapter
+    from player2.record.writer import RecordingOutput, SessionRecorder
+    from player2.video.base import CaptureError
+    from player2.video.wgc import WindowsGraphicsCapture
+
+    profile = load_profile(Path(profile_path)) if profile_path else None
+    target = _resolve_window(profile.window_title_contains if profile else None)
+    if target is None:
+        print("no game window found; pass --profile with window_title_contains")
+        return 1
+
+    for remaining in range(int(delay), 0, -1):
+        print(f"  starting in {remaining}...", flush=True)
+        time.sleep(1.0)
+
+    clock = SessionClock()
+    recorder = SessionRecorder(
+        root=Path(out_dir),
+        clock=clock,
+        metadata={
+            "profile": profile.name if profile else None,
+            "window_title": target.title,
+            "policy": "scripted",
+        },
+    )
+    recorder.start()
+    print(f"recording to {recorder.directory}")
+
+    video = WindowsGraphicsCapture(clock=clock, hwnd=target.hwnd)
+    try:
+        video.start()
+    except CaptureError as error:
+        print(f"could not capture: {error}")
+        recorder.stop()
+        return 1
+
+    # RecordingOutput wraps the real pad, so what gets recorded is what the device was
+    # actually told to do -- not what the policy asked for. Those differ constantly.
+    output = RecordingOutput(inner=ViGEmXboxAdapter(), recorder=recorder, clock=clock)
+    scheduler = Scheduler(output=output, clock=clock, max_hold_ms=250.0)
+    sched_thread = SchedulerThread(scheduler)
+
+    policy = ScriptedPolicy([
+        ActionChunk(keyframes=(Keyframe(t_ms=0.0, left_stick=v), Keyframe(t_ms=800.0)))
+        for v in DIRECTIONS.values()
+    ])
+    loop = AgentLoop(policy=policy, video=video, scheduler=scheduler, clock=clock,
+                     goal="walk in a square", recorder=recorder, min_interval_ms=800.0)
+
+    sched_thread.start()
+    loop.start()
+    try:
+        focus_window(target.hwnd)
+        time.sleep(seconds)
+    finally:
+        loop.stop()
+        sched_thread.stop()
+        video.stop()
+        recorder.stop()
+
+    stats = loop.stats
+    capture_stats = video.stats
+    print(f"\npolicy:   proposed={stats.chunks_proposed} accepted={stats.chunks_accepted} "
+          f"rejected={stats.chunks_rejected} errors={stats.policy_errors}")
+    print(f"capture:  frames={capture_stats.frames_captured} "
+          f"dropped={capture_stats.frames_dropped} errored={capture_stats.frames_errored}")
+    print(f"events:   {stats.events_seen}")
+    print(f"\nsession written to {recorder.directory}")
+    print("  inspect with: python -m player2.demo replay --session " + str(recorder.directory))
+    return 0
+
+
+def replay(session_dir: str) -> int:
+    """Read a recorded session back and show that it is actually aligned."""
+    from player2.record.writer import load_session
+
+    session = load_session(Path(session_dir))
+    manifest = session.manifest
+    print(f"schema v{manifest['schema_version']}  clean={manifest['clean_shutdown']}  "
+          f"truncated={session.truncated}")
+    print(f"metadata: {manifest.get('metadata')}")
+    print(f"counts:   {manifest.get('counts')}")
+    print(f"\nframes={len(session.frames)} pad={len(session.pad)} "
+          f"chunks={len(session.chunks)} events={len(session.events)}")
+
+    # The property that makes this a dataset rather than two log files: for any frame, what
+    # was the controller doing at that instant?
+    pad = sorted(session.pad, key=lambda row: float(row["session_ms"]))
+    print("\nframe -> controller state at that moment:")
+    for frame in session.frames[:8]:
+        t = float(frame["session_ms"])
+        preceding = [row for row in pad if float(row["session_ms"]) <= t]
+        if not preceding:
+            print(f"  frame seq={frame['seq']:<4} t={t:8.1f}ms  (no pad state yet)")
+            continue
+        state = preceding[-1]
+        stick = state.get("left_stick", [0.0, 0.0])
+        print(f"  frame seq={frame['seq']:<4} t={t:8.1f}ms  "
+              f"left_stick=({stick[0]:+.2f},{stick[1]:+.2f})  "
+              f"buttons={state.get('buttons', [])}")
+
+    for event in session.events[:10]:
+        print(f"  event {event['kind']:<12} @{float(event['session_ms']):8.1f}ms  "
+              f"{event.get('detail', '')}")
+    return 0
+
+
 def hold(direction: str, seconds: float, dry_run: bool, delay: float = 0.0) -> int:
     """Hold exactly one direction, once. The least ambiguous test available.
 
@@ -486,10 +603,13 @@ def macro(profile_path: str, name: str, dry_run: bool, delay: float = 0.0) -> in
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command",
-                        choices=["probe", "readback", "capture", "session", "hold", "square",
-                                 "deadman", "macro"])
+                        choices=["probe", "readback", "capture", "agent", "replay", "session",
+                                 "hold", "square", "deadman", "macro"])
+    parser.add_argument("--session", default=None, help="session directory for 'replay'")
     parser.add_argument("--frames", type=int, default=5, help="frames for the 'capture' command")
     parser.add_argument("--out", default="captures", help="output directory for 'capture'")
+    parser.add_argument("--recordings", default="recordings",
+                        help="session root directory for 'agent'")
     parser.add_argument("--direction", choices=sorted(DIRECTIONS), default="right",
                         help="direction for the 'hold' command")
     parser.add_argument("--seconds", type=float, default=1.0, help="seconds per side")
@@ -511,6 +631,12 @@ def main(argv: list[str] | None = None) -> int:
         return readback()
     if args.command == "capture":
         return capture(args.profile, args.frames, args.out, delay)
+    if args.command == "agent":
+        return agent(args.profile, args.seconds, delay, args.recordings)
+    if args.command == "replay":
+        if not args.session:
+            parser.error("replay requires --session")
+        return replay(args.session)
     if args.command == "session":
         return session(args.profile)
     if args.command == "hold":

@@ -10,5 +10,5 @@ dist/
 build/
 recordings/
 *.sqlite
-.pytest-tmp/
+.pytest-*/
 captures/
