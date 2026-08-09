@@ -1,0 +1,46 @@
+# Factorio profile.
+#
+# This file is the ONLY place in the project allowed to know anything about Factorio.
+# The runtime loads it, validates it, and replays the macros; it never interprets them.
+# Swapping in another game is a new file here, not new code in player2/.
+#
+# Bindings below were read from Factorio's own config.ini rather than guessed:
+#   pause-game-controller = controller-righttrigger + controller-start
+#
+# Requires `input-method=game-controller` in %APPDATA%\Factorio\config\config.ini.
+# Factorio detects the virtual pad either way (it logs "Game controller connected"),
+# but it ignores stick input while it believes it is in keyboard-and-mouse mode.
+
+name = "factorio"
+window_title_contains = "Factorio"
+
+# Run this before and after an automated sequence. The runtime has no idea it pauses
+# the game -- it only knows "replay the macro the profile nominated".
+wrap_macro = "toggle_pause"
+
+# Factorio's chat box is also its Lua console: "/c ..." executes arbitrary code, which
+# would let the agent spawn items, reveal the map, or run anything at all. The runtime
+# enforces these patterns without knowing what "/" means.
+text_deny_patterns = ["^/", "^\\s*/"]
+
+# RT is brought fully down BEFORE START is pressed, because analog channels interpolate
+# between keyframes -- pressing both at t=0 would send START while the trigger was still
+# ramping, and the chord might not register.
+[macros.toggle_pause]
+keyframes = [
+  { t_ms = 0,   buttons = [], right_trigger = 0.0 },
+  { t_ms = 40,  buttons = [], right_trigger = 1.0 },
+  { t_ms = 80,  buttons = ["START"], right_trigger = 1.0 },
+  { t_ms = 180, buttons = ["START"], right_trigger = 1.0 },
+  { t_ms = 220, buttons = [], right_trigger = 0.0 },
+]
+
+# Opens the character/inventory screen; useful as a harmless "did anything happen at all"
+# probe that does not move the character or touch the world.
+[macros.open_character]
+keyframes = [
+  { t_ms = 0,   buttons = [] },
+  { t_ms = 40,  buttons = ["Y"] },
+  { t_ms = 140, buttons = ["Y"] },
+  { t_ms = 180, buttons = [] },
+]

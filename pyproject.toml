@@ -27,6 +27,10 @@ known-first-party = ["player2"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Keep temp dirs inside the repo. The default lives in %TEMP%\pytest-of-<user>, which an
+# elevated run creates under a different token -- after which every later non-elevated run
+# fails with PermissionError before a single test executes.
+addopts = "--basetemp=.pytest-tmp"
 
 [tool.mypy]
 python_version = "3.12"
