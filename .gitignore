@@ -11,3 +11,4 @@ build/
 recordings/
 *.sqlite
 .pytest-tmp/
+captures/

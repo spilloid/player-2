@@ -456,6 +456,20 @@ class TestFrame:
         assert (f.seq, f.session_ms, f.source_ms) == (3, 120.5, 118.0)
         assert (f.width, f.height, f.pixel_format) == (1920, 1080, "BGRA8")
 
+    def test_data_may_be_any_buffer_object(self) -> None:
+        """Capture backends hand us numpy arrays, not bytes. Narrowing `data` to bytes
+        would force a conversion of every frame at capture rate purely to satisfy a type
+        annotation -- at 2496x1664 BGRA that is ~16MB per frame. The buffer stays opaque
+        here and `pixel_format` describes how to read it; contracts.py stays stdlib-only
+        precisely so it never has to know about numpy."""
+        class FakeArray:
+            shape = (8, 8, 4)
+
+        for buffer in (b"", bytearray(4), memoryview(b"abcd"), FakeArray(), [1, 2, 3]):
+            frame = Frame(seq=0, session_ms=0.0, source_ms=None, width=8, height=8,
+                          pixel_format="BGRA8", data=buffer)
+            assert frame.data is buffer
+
     def test_source_ms_is_optional(self) -> None:
         """Not every capture backend exposes a hardware timestamp. Recording None is
         honest; silently substituting arrival time is not -- that records queue latency."""

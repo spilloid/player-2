@@ -31,6 +31,7 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from player2.clock import SessionClock
 from player2.contracts import ActionChunk, Keyframe
@@ -208,6 +209,77 @@ def readback() -> int:
         return 0
     print(f"\nOnly {len(moved)}/{len(DIRECTIONS)} directions registered -- this IS our bug.")
     return 1
+
+
+def capture(profile_path: str | None, count: int, out_dir: str, delay: float) -> int:
+    """Capture frames from the game window and write them to disk.
+
+    The first thing the runtime has ever done with eyes. Saving them is not the point --
+    proving that frames arrive with monotonic sequence numbers, plausible timestamps, and
+    an accounting of everything that did NOT arrive is the point, because those are the
+    properties a demonstration dataset lives or dies on.
+    """
+    from player2.clock import SessionClock as _Clock
+    from player2.video.base import CaptureError
+    from player2.video.wgc import WindowsGraphicsCapture
+
+    needle = None
+    if profile_path:
+        needle = load_profile(Path(profile_path)).window_title_contains
+    target = _resolve_window(needle)
+    if target is None:
+        print("no window to capture; pass --profile with window_title_contains")
+        return 1
+
+    for remaining in range(int(delay), 0, -1):
+        print(f"  capturing in {remaining}...", flush=True)
+        time.sleep(1.0)
+
+    clock = _Clock()
+    source = WindowsGraphicsCapture(clock=clock, hwnd=target.hwnd)
+    try:
+        source.start()
+    except CaptureError as error:
+        print(f"could not capture: {error}")
+        return 1
+    try:
+        deadline = time.time() + 10.0
+        while time.time() < deadline and source.stats.frames_captured < count:
+            time.sleep(0.05)
+        frames = source.latest(count)
+    finally:
+        source.stop()
+
+    stats = source.stats
+    print(f"captured={stats.frames_captured} dropped={stats.frames_dropped} "
+          f"errored={stats.frames_errored}")
+    if not frames:
+        print("no frames arrived")
+        return 1
+
+    previous: float | None = None
+    for f in frames:
+        gap = "" if previous is None else f"  (+{f.session_ms - previous:.1f}ms)"
+        previous = f.session_ms
+        src = "none" if f.source_ms is None else f"{f.source_ms:.1f}"
+        print(f"  seq={f.seq:<4} {f.width}x{f.height} session={f.session_ms:8.1f} "
+              f"source={src:>9}{gap}")
+
+    directory = Path(out_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        import cv2
+
+        for f in frames:
+            path = directory / f"frame_{f.seq:04d}.png"
+            # Frame.data is deliberately opaque -- contracts.py must not know about numpy --
+            # so the concrete buffer type is only known here, at the point of use.
+            pixels: Any = f.data
+            cv2.imwrite(str(path), cv2.cvtColor(pixels, cv2.COLOR_BGRA2BGR))
+        print(f"wrote {len(frames)} images to {directory}")
+    except Exception as error:  # noqa: BLE001 - image writing is a convenience, not the test
+        print(f"(could not write images: {error})")
+    return 0
 
 
 def hold(direction: str, seconds: float, dry_run: bool, delay: float = 0.0) -> int:
@@ -414,8 +486,10 @@ def macro(profile_path: str, name: str, dry_run: bool, delay: float = 0.0) -> in
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command",
-                        choices=["probe", "readback", "session", "hold", "square",
+                        choices=["probe", "readback", "capture", "session", "hold", "square",
                                  "deadman", "macro"])
+    parser.add_argument("--frames", type=int, default=5, help="frames for the 'capture' command")
+    parser.add_argument("--out", default="captures", help="output directory for 'capture'")
     parser.add_argument("--direction", choices=sorted(DIRECTIONS), default="right",
                         help="direction for the 'hold' command")
     parser.add_argument("--seconds", type=float, default=1.0, help="seconds per side")
@@ -435,6 +509,8 @@ def main(argv: list[str] | None = None) -> int:
         return probe()
     if args.command == "readback":
         return readback()
+    if args.command == "capture":
+        return capture(args.profile, args.frames, args.out, delay)
     if args.command == "session":
         return session(args.profile)
     if args.command == "hold":

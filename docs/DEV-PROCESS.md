@@ -97,7 +97,17 @@ _Provisional after 2 units. Do not trust these yet; first real revision after Un
   must be released goes to Sol/high for review, regardless of how small the diff is.**
 - **Ask the reviewer to grade the tests too.** Sol caught a test of Claude's that asserted after
   ticking and therefore could not fail for the reason it claimed. Reviewers see faked tests that
-  their authors cannot.
+  their authors cannot. This has now happened three times — twice caught by a reviewer, once by
+  Terra finding a fixture that raised before reaching the code under test. **Claude's tests are
+  the least-reviewed artifact in this process and the most load-bearing.**
+- **The most valuable review finding may not be a defect.** Sol's best contribution in Unit 4
+  was the observation that none of its other 12 findings were reachable by any test, because the
+  code sat behind an API that could only be smoke-tested. The fix was a seam, not a patch. Ask
+  reviewers explicitly: *what here is untestable, and what would make it testable?*
+- **Sol/high has now found 4 criticals in Terra/high output twice.** Both times in code Terra
+  wrote and believed finished, both times invisible to a full green suite, both times concerning
+  a resource whose lifetime or ownership crossed a thread boundary. The routing rule stands and
+  is now supported by two independent observations rather than one.
 
 ## Routing
 
@@ -116,6 +126,53 @@ _Provisional after 2 units. Do not trust these yet; first real revision after Un
 | 1 | Pure-logic contracts: clock, PadState/Keyframe/ActionChunk/Frame, validate, resolve, sample, JSON codec | Luna/medium | Terra/high | 12 (11 Terra + 1 Claude) | 10 | 1 — but in *Claude's* tests, not Luna's code | 100,314 (565s across 3 calls) | See notes below. |
 
 | 2 | Motor system: IControllerOutput, null + ViGEm adapters, tick-driven Scheduler, SchedulerThread | Terra/high | **Sol/high** | 10 (9 Sol + 1 Claude) | 9 | **0** | 147,098 (912s across 3 calls) | See notes below. The headline: 194 passing tests found **none** of the 9 defects. |
+
+| 4 | Eyes: IVideoSource, FrameRing, fake source, Windows Graphics Capture backend | Terra/high | **Sol/high** | 14 (13 Sol + 1 Terra, in Claude's tests) | 13 | 0 | ~205,000 (1,350s across 3 calls) | See notes below. Sol's most valuable finding was not a defect at all. |
+
+### Unit 4 detail — when the reviewer indicts the test strategy
+
+Claude wrote 30 tests; Terra/high implemented (72,951 tok / 474s); everything passed, `mypy
+--strict` and `ruff` clean, and live capture worked against a real game window.
+
+Sol/high review (72,048 tok / 465s) returned **13 defects, 7 critical**, all accepted. The four
+that would have silently corrupted the demonstration dataset — the failure mode that matters
+here, because a crash is recoverable and bad data is not:
+
+1. **A rejected timestamp poisoned the next one.** `_previous_derived_source_ms` was updated
+   *before* the plausibility check, so after one capture-clock reset the following frame was
+   validated against the value that had just been rejected, passed, and was recorded as
+   trustworthy while being about a second wrong. One reset produced a single `None` and then a
+   confidently misaligned timeline. This is exactly the "plausible-looking lie" the design
+   explicitly forbade, implemented anyway.
+2. **Callback failures created unlabelled gaps** — no drop counted, no sequence hole, so the
+   next good frame falsely claimed uninterrupted capture.
+3. **Consumers shared writable numpy arrays.** The model normalising in place would rewrite
+   what the recorder serialises. Freezing a dataclass does not freeze the array inside it.
+4. **No generation token**, so a straggler callback from a stopped session could be accepted
+   into a new one and seed its timestamp anchor from the old capture clock.
+
+Plus: session time not enforced monotonic, a failed `start()` leaving committed frames, the
+user clock being called while holding the state lock (a clock that reads `source.stats`
+deadlocks the capture thread), `latest()` copying the whole ring under lock, unbounded
+`wait()` on shutdown, and a spontaneous close leaking a capture session.
+
+**But the most valuable thing Sol said was not a defect.** It closed with: *"the real backend
+has only live smoke coverage; none of the failure, clock, or lifecycle interleavings above are
+exercised."* That is an indictment of the test strategy, not the code — and it was right. Every
+one of the 13 lived behind a graphics API that could only be smoke-tested, so none of them were
+reachable by any test. The fix was not 13 patches, it was **a seam**: an injectable backend
+factory, after which 20 new tests drive the callbacks directly — delivering frames, raising
+from them, closing spontaneously, restarting — with no graphics stack involved.
+
+Terra also caught a real bug in Claude's new tests: `FakeFrame(width=-5)` allocated
+`bytearray(-80)` and raised inside the fixture, so the rejection path it claimed to test was
+never reached. Second time a Codex tier has found a broken test of Claude's.
+
+Final: 296 tests stable over 3 runs, clean lint and types, and live capture of a real game at
+1716x1316 with zero drops. The timestamp work visibly paid off in that capture: arrival deltas
+were 31.5/49.8/33.0/35.8/47.9ms while acquisition deltas were 50.0/50.0/33.3/33.4/50.0ms —
+quantised to the compositor's cadence. Recording both is what makes that difference visible
+instead of invisible.
 
 ### Unit 2 detail — the most important data point so far
 

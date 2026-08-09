@@ -31,6 +31,9 @@ testpaths = ["tests"]
 # elevated run creates under a different token -- after which every later non-elevated run
 # fails with PermissionError before a single test executes.
 addopts = "--basetemp=.pytest-tmp"
+markers = [
+    "smoke: touches real hardware or a real desktop; skips when unavailable",
+]
 
 [tool.mypy]
 python_version = "3.12"

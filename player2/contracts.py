@@ -186,7 +186,18 @@ class ResolvedKeyframe:
 
 @dataclass(frozen=True)
 class Frame:
-    """Carry immutable video bytes and timestamps without inventing absent hardware time."""
+    """Carry a captured image and its timestamps without inventing absent hardware time.
+
+    `data` is deliberately opaque. Capture backends produce numpy arrays, and narrowing this
+    to `bytes` would force a conversion of every frame at capture rate purely to satisfy an
+    annotation -- roughly 16MB per frame at a modern desktop resolution. `pixel_format`
+    describes how to read the buffer instead, which keeps this module stdlib-only and lets
+    a future backend hand over a GPU handle without changing the contract.
+
+    `source_ms` is the capture API's own timestamp mapped into session time, or None where
+    the backend does not expose one. Substituting arrival time would record queue latency
+    while claiming to record acquisition time, which silently misaligns the whole dataset.
+    """
 
     seq: int
     session_ms: float
@@ -194,7 +205,7 @@ class Frame:
     width: int
     height: int
     pixel_format: str
-    data: bytes
+    data: object
 
     def __post_init__(self) -> None:
         """Validate metadata so recordings cannot contain impossible frame provenance."""
