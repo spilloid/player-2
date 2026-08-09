@@ -203,6 +203,23 @@ def readback() -> int:
     return 1
 
 
+def hold(direction: str, seconds: float, dry_run: bool, delay: float = 0.0) -> int:
+    """Hold exactly one direction, once. The least ambiguous test available.
+
+    `square` chains four chunks and can only be reported as a whole; if one side does not
+    land, there is no way to tell whether that side failed or the run started late. One
+    direction at a time removes that guesswork entirely.
+    """
+    vector = DIRECTIONS[direction]
+    ms = seconds * 1000.0
+    chunk = ActionChunk(keyframes=(
+        Keyframe(t_ms=0.0, left_stick=vector),
+        Keyframe(t_ms=ms, left_stick=vector),
+    ))
+    print(f"holding {direction} {vector} for {seconds}s -- nothing else, no buttons")
+    return _run([chunk], dry_run=dry_run, delay=delay)
+
+
 def _wrap_chunk(profile_path: str | None) -> ActionChunk | None:
     """Load the profile's nominated wrap macro, if a profile was supplied."""
     if not profile_path:
@@ -262,7 +279,9 @@ def macro(profile_path: str, name: str, dry_run: bool, delay: float = 0.0) -> in
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command",
-                        choices=["probe", "readback", "square", "deadman", "macro"])
+                        choices=["probe", "readback", "hold", "square", "deadman", "macro"])
+    parser.add_argument("--direction", choices=sorted(DIRECTIONS), default="right",
+                        help="direction for the 'hold' command")
     parser.add_argument("--seconds", type=float, default=1.0, help="seconds per side")
     parser.add_argument("--dry-run", action="store_true",
                         help="use the null adapter; creates no virtual device")
@@ -280,6 +299,8 @@ def main(argv: list[str] | None = None) -> int:
         return probe()
     if args.command == "readback":
         return readback()
+    if args.command == "hold":
+        return hold(args.direction, args.seconds, args.dry_run, delay)
     if args.command == "macro":
         if not args.profile or not args.name:
             parser.error("macro requires --profile and --name")
