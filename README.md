@@ -1,5 +1,7 @@
 # Player 2
 
+**[Read the project site →](https://spilloid.github.io/player-2/)**
+
 A game-independent embodied AI teammate. It sees the screen, hears the game and you, speaks
 back, remembers what it learns, and plays using an ordinary controller — the same input device
 a human uses. No game APIs, no memory reading, no injection.
@@ -38,7 +40,10 @@ author them.
 | Profiles (game facts as config) | Done, pause chord verified in-game |
 | Window find/focus | Done |
 | Eyes (screen capture) | Done, hardened, verified against a live game |
-| Recorder (synchronized demonstrations) | Next |
+| Recorder (synchronized demonstrations) | Done, hardened |
+| Agent seam (Observation, policy, loop) | Done, hardened |
+| Direct SDK transport (Anthropic/OpenAI/CLI/Ollama) | Done, not yet live-tested |
+| Budget governor (token-rate degrade ladder) | Done, not yet live-tested |
 | Keyboard/mouse + text entry | Planned |
 | Ears, voice, memory, MCP control plane | Planned |
 

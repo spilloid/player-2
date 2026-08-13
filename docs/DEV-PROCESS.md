@@ -173,6 +173,300 @@ supporting._
 
 | 5+6 | Recorder + agent seam + shared frame encoding (6 files, 2 packages) | **Sol/ultra** | **Sol/high** | 17 (15 Sol + 2 from live runs) | 17 | 0 | ~480,000 (~2,900s across 4 calls) | First use of ultra. Produced a large, coherent, working implementation in one pass — and still needed 15 defects fixed. |
 
+| 7 | Direct SDK transport: provider-neutral policy seam (`model_schema`, `model_policy`) + three transports (Anthropic, OpenAI, `codex exec` CLI fallback) — 5 files | **Sol/ultra** | **Sol/high** | 9 | 8 real, 1 correctly self-rejected by the reviewer | 0 | ~143,000 (666s + 1 call) | See notes below. First unit where two of the reviewer's findings were reproduced directly against real Windows process behavior before being adjudicated, rather than adjudicated from the writeup alone. |
+
+| 8 | Budget governor (`budget.py`: rolling token-rate window, degrade ladder, `GovernedTransport`) + `AgentLoop` cadence integration + 4th transport (`OllamaTransport`, OpenAI-compat) + `last_usage` telemetry on all 4 transports — 7 files | **Terra/high** | **Sol/high** | 11 + 1 Claude (self-caught before review) | 11 real, 6 fixed with new tests, 5 accepted-and-documented as scoped limitations | 0 | 57,167 (Terra) + 19,505 (Sol/high review) | See notes below. Cheapest full-unit implementation to date at this scope (7 files) — a well-decomposed, test-first spec let Terra/high do it directly with no Sol/ultra escalation. |
+
+### Unit 8 detail — a Critical finding that was invisible to my own test spec by construction
+
+Direct successor to Unit 7 by explicit user instruction, given before any live test of the SDK
+transports was allowed to happen: *"Build the Budget Governor first, no live test until then."*
+Scope grew mid-flight, twice, on further explicit instruction — Ollama support ("with that in
+mind, not within months" — i.e. now, not deferred) landed in the same unit as the governor
+rather than its own.
+
+Claude wrote 96 tests across 5 files (`test_budget_governor.py`, `test_budget_governed_transport.py`,
+`test_agent_budget_integration.py`, plus additions to the three existing transport test files
+and a new `test_agent_ollama_transport.py`) as the spec for: `BudgetGovernor` (rolling
+tokens-per-minute window, NORMAL/DEGRADED/EXHAUSTED ladder, non-sticky recovery),
+`GovernedTransport` (a transparent `IModelTransport` wrapper that feeds the governor as a side
+effect — zero changes required to `SDKPolicy` or the three Unit 7 transports beyond one added
+`last_usage` property each), `AgentLoop`'s new optional `governor=` hook, and `OllamaTransport`
+as a thin subclass of `OpenAITransport` (Ollama's OpenAI-compatible endpoint means zero
+duplicated request/response logic).
+
+**Terra/high** implemented all of it in one pass (57,167 tok) — cheapest full-unit
+implementation to date at this file count, credited to a genuinely well-decomposed, fully
+test-first spec rather than anything about the tier. 96/96 targeted tests green, `ruff` and
+`mypy --strict` clean. Terra's own full-suite run reported 4 failures; independent
+re-verification (Claude) found all four were artifacts of running two pytest processes against
+the same `.pytest-tmp` and my own concurrent profile.py edit landing mid-run — a clean
+sequential re-run showed 548/548 passing, not a real defect. **Worth noting for the log: this
+is the inverse of the usual failure mode here — not a green suite hiding a real bug, but a red
+report hiding a non-bug.** Verify before trusting either direction.
+
+**Claude caught one bug before sending anything for review**, by reading the diff rather than
+trusting it: `_decide()` stamped `Observation.deadline_ms` from the constructor's *fixed*
+`min_interval_ms`, not the governor's actual per-cycle interval — so a degraded cycle that
+doubled its interval would still tell the model it had only the base amount of time left. The
+model reasons about its remaining budget directly from that field (see
+`model_schema.observation_to_prompt`), so this was a lie to the model, not a cosmetic stats gap.
+Fixed by threading the real `interval_ms` into `_decide()`. Flagged for the reviewer as a
+*class* of bug to hunt for elsewhere in the diff (a value computed once, used somewhere it
+needed recomputing) — see finding 6 below, which is exactly that pattern recurring one layer up.
+
+**Sol/high review** (19,505 tok) returned 11 ranked findings, headlined by one that says
+something uncomfortable about test-first development itself:
+
+1. **Critical, and invisible to my own 96 tests by construction, not by accident: a failed
+   model response recorded zero tokens.** `GovernedTransport` only called `governor.record()`
+   inside the success path — I had written `test_a_failing_call_records_nothing` *asserting*
+   that as correct, reasoning "we don't know what a failed call cost, so don't guess." Sol's
+   rebuttal: a response that fails LOCAL parsing (wrong tool, malformed JSON) was still
+   generated and billed by the provider — and that failure mode is exactly what a small,
+   possibly-tool-calling-unreliable local Ollama model is most likely to produce. The result:
+   the one caller most likely to need the budget cap (an experimental local model) is exactly
+   the one the governor would have been blind to, forever, at real cost. **My own test spec
+   encoded the bug as a passing assertion.** Fixed by always recording — real usage on
+   success, a conservative estimate on failure — and replacing that test with
+   `test_a_failing_call_still_records_a_conservative_estimate`. A second, subtler bug
+   surfaced while fixing this: naively reading the inner transport's `last_usage` after a
+   failure would have double-counted a PRIOR successful call, since `last_usage` intentionally
+   retains its last value across a failure. Added
+   `test_a_failing_call_does_not_charge_a_stale_usage_from_a_prior_success` to pin that down
+   too — never found by Sol, found by Claude while implementing Sol's fix.
+2. **High, fixed:** the token estimate fallback counted only prompt characters and image
+   count — a 20,000-character system prompt or a large tool schema would look almost free.
+   `estimate_tokens` now includes system and schema length plus a non-zero output floor
+   (a response that generated zero output tokens is not the realistic case a fallback exists
+   to cover).
+3. **High, documented as an accepted scope limit, not fixed:** budget admission isn't atomic
+   — `decide()` is a snapshot, not a reservation, so two callers sharing one governor could
+   both start expensive calls between a decision and the matching record. Real, but the only
+   real caller (`AgentLoop._run`) never has two `propose()` calls in flight at once; true
+   per-call admission control is a heavier mechanism than CARRYOVER asked for. Documented
+   explicitly in `budget.py`'s module docstring as a single-caller assumption.
+4. **High-when-shared/Low-otherwise, same documented limitation as 3:** `last_usage` is
+   ambient mutable state on a transport instance; concurrent callers on the same instance
+   could interleave. Same single-caller assumption, documented in the same place.
+5. **High for non-default windows, dormant at the shipped default:** `tokens_per_minute_limit`
+   was compared directly against the raw window sum regardless of `window_seconds` — a 30s
+   window would silently admit twice the configured per-minute rate, a 120s window half of it.
+   Every one of my 96 tests used the 60s default, so this was arithmetically invisible to the
+   whole suite. Fixed by scaling the limit by `window_seconds / 60`; added
+   `test_the_limit_scales_with_a_non_default_window_length` and a companion test for a longer
+   window, specifically because the default-only test pattern is what let this one through.
+6. **Medium, documented, not fixed:** cadence transitions can lag by up to one stale interval
+   — `_run` re-evaluates `decide()` every iteration, but the current cycle's wait gate was
+   already set from the previous cycle's interval. Bounded and non-unsafe (the deadman still
+   governs the pad regardless of cognition's cadence); re-architecting `_run`'s wait loop to
+   avoid it touches hardened, already-reviewed hot-path timing code for a cosmetic cadence lag,
+   not a safety gap. Documented in `AgentLoop.__init__`'s docstring.
+7. **Medium, documented, not fixed:** `AgentLoop`'s own `min_interval_ms`/`frames_per_observation`
+   become dead configuration whenever a governor is supplied — nothing cross-checks them
+   against the governor's own base values. Documented in the same docstring; the real fix is
+   wiring discipline (derive both from one source when constructing them together in demo.py),
+   not new validation code in an already-reviewed constructor.
+8. **Medium, fixed:** a broken usage object or a broken governor could turn an otherwise-
+   successful call into a raised exception, or mask a real failure's exception with an
+   accounting one. `GovernedTransport._record` now swallows its own exceptions unconditionally
+   — accounting is subordinate to the actual result, same principle `loop.py` already applies
+   to the recorder ("a broken log must not kill cognition"). Added two tests: a broken
+   governor doesn't fail a successful call, and doesn't mask a real failure either.
+9. **Low–Medium, fixed:** `TokenUsage` rejected negative counts but accepted bools, floats,
+   NaN, and infinity — a NaN entry makes every `<` comparison in `_decision()` false, which
+   reads as permanently EXHAUSTED and never recovers even once it ages out of the window.
+   Tightened to the same bool-before-int, `math.isfinite` pattern already used throughout
+   `contracts.py`.
+10. **Low for the real clock, Medium for an arbitrary one, documented:** `_prune` assumes
+    append-order matches time-order, which any `Clock` satisfying this package's own monotonic
+    contract guarantees (and the real `SessionClock` — `time.perf_counter()`, lock-serialized
+    reads — genuinely does). One-line comment added; no code change, since enforcing it would
+    duplicate a guarantee the `Clock` Protocol already makes.
+11. **Low, resolved as a side effect of fixing 2:** `record(None)`'s fallback used to be
+    `estimate_tokens(prompt_chars=0, image_count=0)` — one token, which reads as "this cost
+    nothing" rather than "unknown." The non-zero output floor from fixing finding 2 already
+    raises this to a more honestly conservative figure; no separate constant needed.
+
+**New process lesson, the one worth keeping:** finding 1 was not a gap in coverage, it was a
+test that *actively certified the bug as correct behavior*, written by the same mind that
+designed the mechanism it was testing — the exact failure mode Unit 2's log first named
+("tests written by the same mind that specified the design encode the same blind spots") but
+sharper here, because this time the flawed reasoning was captured in the test's own docstring,
+not just its absence. **Rule: when a reviewer's finding is "your test asserts the wrong thing,"
+that is not a lower-severity version of "you missed a case" — treat it as evidence to
+specifically re-examine every OTHER test whose docstring contains a confident justification,
+because that confidence is exactly what stopped the author from spotting the same class of
+error a second time** (finding 5's window-scaling bug is the same pattern: real, arithmetically
+simple, and invisible to 96 tests because every one of them used the one default value that
+made the bug dormant).
+
+Final: 560 tests stable across 3 runs, `ruff` and `mypy --strict` clean.
+
+#### Live verification, same day — the first real API call this project has ever made
+
+Joey installed Ollama locally and pulled `smollm2:1.7b` unprompted, which forced the first
+actual live test of the transport stack built in Units 7 and 8, sooner than planned. Two
+findings, both from running the real thing rather than a fake client:
+
+- **`smollm2:1.7b` (capabilities: `completion`, `tools` — no `vision`) declined the forced
+  tool call outright.** A raw diagnostic call against Ollama's OpenAI-compatible endpoint
+  showed the model returning plain text — *"The query cannot be answered with the provided
+  tools."* — instead of a `tool_calls` entry, despite the endpoint's own capability listing
+  claiming `tools` support and despite `tool_choice` being forced. `OllamaTransport` raised
+  `ModelTransportError` correctly; nothing crashed, nothing hung. This is real evidence that
+  the module docstring's "UNVERIFIED whether the default model honors forced tool_choice"
+  caveat, written before any live call, was warranted — not hedging.
+- **`moondream` (capabilities: `completion`, `vision` — no `tools`) confirmed a second gap:**
+  the vision-capable model available in Ollama's library at this size does not advertise
+  tool-calling support at all. Between the two models pulled on this machine, **no single
+  local model currently does both halves of `propose()`'s job** — seeing the frame and
+  returning a forced structured call. This is a real constraint on the "small, accept the
+  slowness" Ollama experiment Joey asked for, not a bug in this project's code.
+- **The Unit 8 fix for finding 1 held up live, not just in the 96 tests that exercise it in
+  isolation.** The failed call above still left `governor.stats.tokens_in_window == 740` —
+  `GovernedTransport` correctly recorded a conservative estimate despite the failure, exactly
+  the property that finding closed. First time a Sol/high finding's fix has been confirmed
+  against a real failure rather than only a fake one.
+
+Decision: stop here for now rather than chase a third local model. The plumbing — Ollama
+connectivity, `OllamaTransport`, `SDKPolicy`, `GovernedTransport`, the budget governor's
+failure-path accounting — is now confirmed working end-to-end against a real server. What
+remains unverified is narrower and more specific than before: not "does this whole stack
+work," but "does any small local model reliably do forced tool-calling over vision input."
+`ollama_transport.py`'s module docstring updated to record this rather than repeat the
+now-partially-answered original caveat. The Anthropic and OpenAI transports remain entirely
+unverified against real credentials — neither has been live-tested yet.
+
+#### Live verification, 2026-08-13 — found one, and hit an unrelated platform bug on the way
+
+Joey: *"I'm game, let's find a small model that does both."* Two things happened before a
+working model did, neither of them a defect in this project:
+
+- **Every new `ollama pull` from Ollama's own registry started failing with `401
+  Unauthorized`,** for any model name tried, while the two models pulled two days earlier kept
+  working fine. Traced to a known, unresolved, Windows-specific bug in Ollama itself
+  (`ollama/ollama#15074`) — registry auth breaks after some local state change, `ollama
+  signin`'s login flow doesn't recover it. Confirmed this was a platform issue and not a
+  project one exactly the way PLATFORM-NOTES.md's own rule says to: read the other system's
+  logs (here, its GitHub issue tracker) before touching ours. Workaround: `ollama pull
+  hf.co/<org>/<repo>` pulls directly from Hugging Face, bypassing Ollama's registry — and its
+  auth bug — entirely.
+- **`hf.co/Qwen/Qwen3-VL-8B-Instruct-GGUF` (capabilities: vision AND tools) is the first model
+  found that does both halves of `propose()`'s job**, confirmed against this project's actual
+  production code path, not a simplified stand-in: a real `Frame`, the real
+  `action_chunk_tool_schema()`, real `SDKPolicy.propose()`. First real attempt against that
+  strict schema hit the 180s timeout entirely (model was warm, per `ollama ps` — this was
+  genuine constrained-decoding slowness against a harder schema, not a cold-load artifact).
+  Second attempt, timeout raised to 480s, returned in 65.1s but tripped one of
+  `contracts.py`'s own business rules (`first keyframe must be at t_ms=0`) — correctly
+  rejected as `ModelResponseError`, exactly the intended behavior for a malformed-but-honest
+  proposal, not a transport failure. Third attempt succeeded completely: a valid `ActionChunk`
+  back through the full stack in 25.4s once warm. **8B was needed, not chosen** — every
+  smaller model tried (1B–1.7B) failed at either vision or tool-calling; "small" for this
+  experiment turned out to mean "smallest model that actually does the job."
+  `_DEFAULT_MODEL` in `ollama_transport.py` changed from `moondream` (confirmed unable to
+  tool-call at all) to this model, now a confirmed-working default instead of a
+  confirmed-broken one.
+
+**Numbers worth keeping:** real token usage for the successful strict-schema call was 1,664
+input + 81 output = 1,745 total — confirming the whole telemetry path (`OllamaTransport.
+last_usage` → `GovernedTransport` → `BudgetGovernor`) reports real provider numbers live, not
+just estimates, when a model supports it. Latency ranged from 25s (warm, clean pass) to over
+180s (warm, but a harder schema) on this CPU-only Surface Laptop 4 — confirming CARRYOVER's
+standing note that the "fast" policy loop's ~1.5s cadence is not remotely achievable with this
+model on this hardware. Fine for the exploratory purpose Joey framed this as; not yet viable
+for live gameplay.
+
+### Unit 7 detail — reproducing a reviewer's claims instead of trusting the writeup
+
+CARRYOVER.md's roadmap named this the next step in plain terms: replace the ad-hoc `codex
+exec` calls used to *measure* transport cost with a real model-backed policy, built behind
+`IFastPolicy`/`IDeliberativeModel` so a CLI fallback needs no API key. Claude wrote 74 tests
+across five files first: `model_schema.py` (pure prompt/schema/decode logic, reusing
+`contracts.chunk_from_dict` and `video.encode.{downscale,encode_jpeg}` rather than inventing a
+second validator or a second image pipeline) and `model_policy.py` (a provider-neutral
+`SDKPolicy` behind an injectable `IModelTransport` seam), plus three thin transports —
+Anthropic, OpenAI (optional import, mirroring `voice`'s opt-in pattern), and a `codex exec`
+CLI fallback. Every transport test uses a fake client or a fake process runner; none needs a
+real API key or the `codex` binary, closing the same gap Unit 4 named — untestable-without-a-
+seam glue — before it could open.
+
+**Sol/ultra** implemented all five files in one pass (121,635 tok, 666s): 74/74 tests green,
+`ruff` and `mypy --strict` clean, no deviations from spec. Independent re-verification (Claude,
+not trusted from the implementer's own report) confirmed all of it and additionally caught two
+things Sol/ultra's own report missed: a stale default model id (`claude-sonnet-4-5`, not this
+account's actual `claude-sonnet-5`) and two lint failures — but both were in *Claude's own test
+files* (an unused import, one over-length line), not in the generated code. First time this log
+has recorded a lint slip in the test-authoring side rather than the implementation side.
+
+**Sol/high** review (21,781 tok) returned 9 ranked findings, 2 critical, 3 high, 3 medium, 1
+low. Two of them made falsifiable claims about real OS behavior rather than claims about the
+diff's logic, and were reproduced directly instead of adjudicated from the writeup:
+
+1. **Critical, confirmed by reproduction: Windows does not kill a subprocess's children.**
+   `subprocess.run(timeout=...)`'s `TimeoutExpired` handling only sends `TerminateProcess` to
+   the direct child. `codex.cmd` is an npm shim that spawns a real `node.exe` child, so a
+   timed-out call could leave that process running past the deadline the caller thought it
+   enforced. Reproduced with a throwaway parent/grandchild script before believing it: a bare
+   kill left the grandchild alive; `taskkill /F /T /PID <parent>` killed the whole tree. Fixed
+   by switching `cli_transport.py`'s default runner to `Popen` with a `taskkill`-based
+   tree-kill fallback on timeout (POSIX path uses `os.killpg`).
+2. **High, confirmed by inspection: no `cwd` meant codex could read the real working
+   directory.** `-s read-only` permits reads and read-oriented tools; without an explicit
+   `cwd`, a model that decided to look around before answering would find the actual repo, not
+   nothing. This is not hypothetical here specifically because the caller's prompt is built
+   from **live, attacker-reachable content** — screen text, scheduler event detail strings —
+   so a crafted in-game message is a real (if narrow) prompt-injection surface. Fixed by
+   confining every call to the same disposable per-call temp directory already used for images
+   and the schema file; codex now has nothing to find but its own inputs.
+3. **Critical, accepted without a repro (a design gap visible directly in the diff, not a claim
+   about external behavior): unbounded SDK auto-retry can multiply the caller's timeout
+   budget.** Fixed by setting `max_retries=0` on both default clients (Anthropic and OpenAI).
+   The residual risk the reviewer named — a slow-trickling connection that never fails a
+   single read but never finishes either — is real and is **not** fixed here; it is exactly
+   the "degrade rather than hang" problem CARRYOVER already scopes to the next unit, the
+   Budget Governor, and fixing a slice of it piecemeal here would fragment that design instead
+   of anticipating it.
+4. **High, accepted and deferred to the same Budget Governor unit:** `SDKPolicy` never shrinks
+   `timeout_s` to the observation's remaining decision budget, and frame preprocessing
+   (encode/downscale/base64) is unbounded in count and memory. Both are literally the shape of
+   work CARRYOVER's roadmap already assigns to that unit ("lengthen the chunk horizon... drop
+   frames per observation").
+5. **Medium, fixed (cheap, mechanical, no repro needed):** OpenAI's transport had no output
+   token cap, unlike Anthropic's sibling implementation — an inconsistency, not a hypothesis.
+   Added a matching `max_completion_tokens` cap. Also made the `anthropic` import optional,
+   matching the pattern the OpenAI transport already used, so a base install doesn't pay a hard
+   `ModuleNotFoundError` for an unused provider.
+6. **Medium, accepted-as-described but rejected as a fix target:** the module-level retained-
+   temp-directory scheme in `cli_transport.py` has a real cross-call race under concurrency —
+   but the only code that ever reads a call's directory *after* the call returns is test
+   introspection. No production caller touches the filesystem path; every real caller only
+   ever sees the already-parsed return value. Documented rather than "fixed," because there is
+   no reachable failure to fix yet.
+7. **Low, deferred:** a malformed Anthropic text block (`text` present but non-string) is
+   silently dropped rather than raising. Correct as described, low consequence (worst case,
+   `deliberate()` returns `None` instead of an error), left as-is.
+8. **Rejected outright, and the reviewer said so themselves:** `CLITransport` ignoring
+   `tool_name` and not validating the returned object's shape beyond "is a dict" looked
+   concerning in isolation, but `SDKPolicy.propose()` immediately hands the result to
+   `chunk_from_dict`, which already rejects `{}` or an unrelated object. The reviewer's own
+   "Judgment on the specifically raised points" section correctly concluded this is not a
+   controller-integrity defect given the actual call chain — a good example of a reviewer
+   grading its own finding down once shown the caller, and being right to.
+
+**New process lesson:** a described defect is a hypothesis about the world until it's checked
+against the world. Two of nine findings here were claims about real OS process semantics, not
+claims about the code's logic — and cost about ten minutes apiece to settle with a throwaway
+script rather than being adjudicated from prose alone. Both held up exactly as described. A
+third, equally severe finding (the timeout/deadline gap) needed no repro because it was a
+design fact readable directly in the diff. **Rule: when a finding claims something about an
+external system's behavior rather than about the diff's logic, reproduce it before adjudicating
+— the five minutes it costs is cheap next to shipping a fix for a bug that doesn't exist, or
+rejecting one that does.**
+
+Final: 489 tests stable across 3 runs, `ruff` and `mypy --strict` clean.
+
 ### Units 5+6 detail — the first ultra run, and a design error of Claude's
 
 Combined at Joey's suggestion, correctly: the recorder writes frames to disk and the agent

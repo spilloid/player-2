@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Player 2 — an embodied AI teammate</title>
+<meta name="description" content="Player 2 is a game-independent AI teammate with eyes, hands, ears, and memory. It plays through ordinary controller input, the same as a human — no game APIs, no memory reading, no injection.">
+<meta property="og:title" content="Player 2 — an embodied AI teammate">
+<meta property="og:description" content="Eyes, hands, ears, memory. No game APIs. It watches the screen and holds a controller, same as you do.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2314171f'/%3E%3Ccircle cx='11' cy='16' r='3.4' fill='%23e6a94a'/%3E%3Ccircle cx='21' cy='16' r='3.4' fill='%234fb6a6'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders:wght@700;800;900&family=Public+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #F4F5F8;
+    --surface: #FFFFFF;
+    --surface-2: #E9EBF0;
+    --text: #171A21;
+    --text-dim: #565F70;
+    --border: #D7DAE2;
+    --accent: #A8710E;
+    --accent-ink: #FFFFFF;
+    --accent-2: #2B8577;
+    --shadow: 0 1px 2px rgba(23,26,33,0.06), 0 8px 24px rgba(23,26,33,0.06);
+    --font-display: "Big Shoulders", system-ui, sans-serif;
+    --font-body: "Public Sans", system-ui, -apple-system, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Code", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14171F;
+      --surface: #1B2029;
+      --surface-2: #232936;
+      --text: #EDEFF4;
+      --text-dim: #9AA3B2;
+      --border: #2D3444;
+      --accent: #E6A94A;
+      --accent-ink: #1A1300;
+      --accent-2: #4FB6A6;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 12px 32px rgba(0,0,0,0.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14171F;
+    --surface: #1B2029;
+    --surface-2: #232936;
+    --text: #EDEFF4;
+    --text-dim: #9AA3B2;
+    --border: #2D3444;
+    --accent: #E6A94A;
+    --accent-ink: #1A1300;
+    --accent-2: #4FB6A6;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 12px 32px rgba(0,0,0,0.35);
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
+  }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent); text-decoration-thickness: 1.5px; text-underline-offset: 3px; }
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 28px; }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    font-weight: 500;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--accent-2);
+    margin: 0 0 14px;
+  }
+
+  h1, h2, h3 { font-family: var(--font-display); font-weight: 800; text-wrap: balance; margin: 0; letter-spacing: 0.005em; }
+  h2 { font-size: clamp(28px, 4vw, 40px); text-transform: uppercase; letter-spacing: 0.01em; }
+  h3 { font-size: 20px; text-transform: uppercase; letter-spacing: 0.02em; }
+  p { max-width: 62ch; color: var(--text); }
+  p.dim, .dim { color: var(--text-dim); }
+
+  code, .mono { font-family: var(--font-mono); }
+  code { background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 0.1em 0.4em; font-size: 0.88em; }
+  pre {
+    font-family: var(--font-mono);
+    font-size: 14.5px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px 20px;
+    overflow-x: auto;
+    line-height: 1.55;
+  }
+  pre code { background: none; border: none; padding: 0; }
+
+  /* ---------- header ---------- */
+  header.site {
+    position: sticky; top: 0; z-index: 40;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  .nav-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 0; }
+  .wordmark { display: flex; align-items: baseline; gap: 8px; font-family: var(--font-display); font-weight: 900; font-size: 19px; letter-spacing: 0.02em; text-transform: uppercase; }
+  .wordmark span { color: var(--accent); }
+  nav.links { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; }
+  nav.links a { color: var(--text-dim); font-size: 14px; font-weight: 600; text-decoration: none; }
+  nav.links a:hover { color: var(--text); }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-family: var(--font-mono); font-weight: 600; font-size: 14px;
+    padding: 9px 16px; border-radius: 6px; text-decoration: none;
+    border: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  .btn-primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  .btn-primary:hover { filter: brightness(1.06); }
+  .btn-ghost { color: var(--text); background: transparent; }
+  .btn-ghost:hover { background: var(--surface-2); }
+  .theme-toggle {
+    width: 34px; height: 34px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); cursor: pointer;
+    display: flex; align-items: center; justify-content: center; font-size: 15px;
+  }
+
+  /* ---------- hero ---------- */
+  .hero { padding: 76px 0 20px; }
+  .hero h1 {
+    font-size: clamp(40px, 6.4vw, 76px);
+    text-transform: uppercase;
+    line-height: 0.98;
+    max-width: 15ch;
+  }
+  .hero .lede { font-size: 19px; max-width: 56ch; margin-top: 22px; color: var(--text-dim); }
+  .cta-row { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 30px; }
+
+  .trace-card {
+    margin-top: 56px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    padding: 22px 22px 16px;
+  }
+  .trace-card figure { margin: 0; }
+  .trace-card svg { display: block; width: 100%; height: auto; overflow: visible; }
+  figcaption { font-size: 14px; color: var(--text-dim); margin-top: 12px; max-width: none; }
+  figcaption b { color: var(--text); font-weight: 600; }
+
+  /* ---------- sections ---------- */
+  section { padding: 84px 0; border-top: 1px solid var(--border); }
+  section:first-of-type { border-top: none; }
+  .section-head { max-width: 68ch; margin-bottom: 44px; }
+
+  /* two-up cards */
+  .use-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+  @media (max-width: 780px) { .use-grid { grid-template-columns: 1fr; } }
+  .use-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 30px 28px; box-shadow: var(--shadow);
+  }
+  .use-card h3 { margin-bottom: 12px; }
+  .use-card .tag { display: inline-block; font-family: var(--font-mono); font-size: 11.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--surface); background: var(--text-dim); border-radius: 4px; padding: 3px 8px; margin-bottom: 16px; }
+  .use-card.play .tag { background: var(--accent-2); }
+  .use-card.bench .tag { background: var(--accent); color: var(--accent-ink); }
+  .use-card p { max-width: none; }
+  .use-card .note { margin-top: 16px; padding-top: 16px; border-top: 1px dashed var(--border); font-size: 14.5px; }
+
+  /* anatomy grid */
+  .anatomy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .anatomy-item { background: var(--surface); padding: 26px 22px; }
+  .anatomy-item .label { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent-2); margin-bottom: 10px; }
+  .anatomy-item p { font-size: 14.5px; color: var(--text-dim); max-width: none; margin: 0 0 14px; }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 11.5px; letter-spacing: 0.05em; padding: 3px 9px; border-radius: 20px; border: 1px solid var(--border); }
+  .pill.done { color: var(--accent-2); border-color: color-mix(in srgb, var(--accent-2) 45%, var(--border)); }
+  .pill.planned { color: var(--text-dim); }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+  /* constraint quote */
+  .constraint {
+    background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--accent);
+    border-radius: 4px 12px 12px 4px; padding: 32px 32px; box-shadow: var(--shadow);
+  }
+  .constraint p.quote { font-size: 21px; font-weight: 500; max-width: 42ch; margin: 0 0 18px; }
+  .constraint p.quote code { font-size: 0.85em; }
+
+  /* diagram wrap */
+  .diagram-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; box-shadow: var(--shadow); }
+  .diagram-wrap svg { display: block; min-width: 720px; width: 100%; height: auto; }
+
+  ol.invariants { margin: 40px 0 0; padding: 0; list-style: none; counter-reset: inv; display: grid; gap: 12px; }
+  ol.invariants li { counter-increment: inv; display: grid; grid-template-columns: 34px 1fr; gap: 14px; align-items: baseline; font-size: 15px; color: var(--text-dim); }
+  ol.invariants li::before { content: counter(inv); font-family: var(--font-mono); font-weight: 600; color: var(--accent); font-size: 14px; }
+  ol.invariants li b { color: var(--text); font-weight: 600; }
+
+  /* status */
+  .status-callout { display: flex; gap: 18px; align-items: baseline; flex-wrap: wrap; margin-bottom: 34px; }
+  .status-callout .big { font-family: var(--font-display); font-weight: 900; font-size: 46px; color: var(--accent); text-transform: uppercase; }
+  table.subsystems { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+  table.subsystems th { text-align: left; font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-dim); font-weight: 500; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  table.subsystems td { padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  table.subsystems tr:last-child td { border-bottom: none; }
+  .stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px,1fr)); gap: 18px; margin-top: 30px; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; }
+  .stat .n { font-family: var(--font-mono); font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .l { font-size: 12.5px; color: var(--text-dim); margin-top: 4px; }
+
+  /* process */
+  .findings { display: grid; gap: 14px; margin-top: 30px; }
+  .finding { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; font-size: 15px; }
+  .finding q { font-style: normal; }
+  .roles { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 28px; }
+  @media (max-width: 780px) { .roles { grid-template-columns: 1fr; } }
+  .role { border: 1px solid var(--border); border-radius: 10px; padding: 20px 22px; background: var(--surface-2); }
+  .role .who { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent-2); margin-bottom: 8px; }
+  .role p { max-width: none; font-size: 14.5px; }
+
+  /* footer */
+  footer { padding: 70px 0 50px; border-top: 1px solid var(--border); }
+  .foot-grid { display: grid; grid-template-columns: 1.3fr 1fr 1fr; gap: 40px; }
+  @media (max-width: 780px) { .foot-grid { grid-template-columns: 1fr; } }
+  footer h4 { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-dim); margin: 0 0 14px; }
+  footer ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 9px; }
+  footer ul a { color: var(--text); text-decoration: none; font-size: 14.5px; }
+  footer ul a:hover { text-decoration: underline; }
+  .foot-note { margin-top: 50px; padding-top: 24px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; gap: 20px; flex-wrap: wrap; font-size: 13px; color: var(--text-dim); }
+
+  section p.lede-block { font-size: 16.5px; }
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap nav-row">
+    <a class="wordmark" href="#top" style="text-decoration:none; color:inherit;">PLAYER <span>2</span></a>
+    <nav class="links">
+      <a href="#use">Play / Benchmark</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#status">Status</a>
+      <a href="#process">Process</a>
+      <a href="CARRYOVER.md">Docs</a>
+    </nav>
+    <div style="display:flex; align-items:center; gap:10px;">
+      <button class="theme-toggle" id="themeToggle" type="button" aria-label="Toggle color theme" title="Toggle color theme">◐</button>
+      <a class="btn btn-primary" href="https://github.com/spilloid/player-2">GitHub ↗</a>
+    </div>
+  </div>
+</header>
+
+<main id="top">
+
+  <section class="hero wrap" style="border-top:none;">
+    <p class="eyebrow">AN EMBODIED, GAME-INDEPENDENT AI TEAMMATE</p>
+    <h1>Player 2 has entered the game.</h1>
+    <p class="lede">Eyes, hands, ears, and memory — wired to ordinary player I/O. It watches
+      the screen and holds a controller, the same way you do. No game APIs. No memory reading.
+      No injection. If it can't see it or press it, it doesn't know it.</p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="https://github.com/spilloid/player-2">View on GitHub ↗</a>
+      <a class="btn btn-ghost" href="#use">See what it's for ↓</a>
+    </div>
+
+    <div class="trace-card">
+      <figure>
+        <svg viewBox="0 0 880 210" role="img" aria-label="A trace of commanded controller input over time: it steps to a new value each time a decision arrives, holds steady between decisions, and eases back to neutral the moment decisions stop arriving.">
+          <line x1="20" y1="170" x2="860" y2="170" stroke="currentColor" stroke-opacity="0.25" stroke-width="1" stroke-dasharray="2 5"/>
+          <text x="20" y="188" font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor" fill-opacity="0.55">neutral (0,0)</text>
+
+          <polyline points="20,170 60,170 60,96 240,96 240,66 420,66 420,126 600,126 660,126 700,170 860,170"
+                    fill="none" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" opacity="0.85"/>
+
+          <g font-family="IBM Plex Mono, monospace" font-size="11" fill="currentColor">
+            <circle cx="60" cy="96" r="4" fill="var(--accent-2)"/>
+            <text x="60" y="82" text-anchor="middle" fill-opacity="0.8">chunk accepted</text>
+
+            <circle cx="240" cy="66" r="4" fill="var(--accent-2)"/>
+            <text x="240" y="52" text-anchor="middle" fill-opacity="0.8">preempted</text>
+
+            <circle cx="420" cy="126" r="4" fill="var(--accent-2)"/>
+            <text x="420" y="148" text-anchor="middle" fill-opacity="0.8">preempted again</text>
+          </g>
+
+          <line x1="660" y1="30" x2="660" y2="170" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4 4" opacity="0.7"/>
+          <text x="666" y="42" font-family="IBM Plex Mono, monospace" font-size="11" fill="var(--accent)">no fresh chunk arrives</text>
+
+          <circle cx="700" cy="170" r="4.5" fill="var(--accent)"/>
+          <text x="706" y="196" font-family="IBM Plex Mono, monospace" font-size="12" font-weight="600" fill="var(--accent)">deadman: pad released</text>
+        </svg>
+        <figcaption><b>Silence means stop.</b> The pad holds whatever was last commanded — it
+          never invents motion between decisions. The instant fresh intent stops arriving, a
+          deadman timer releases every input. That is the difference between a teammate and a
+          character sprinting into a lake because the model went quiet.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section id="use" class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Two reasons to plug in</p>
+      <h2>Play together, or measure against it</h2>
+    </div>
+    <div class="use-grid">
+      <div class="use-card play">
+        <span class="tag">Play</span>
+        <h3>An AI teammate, not a walkthrough</h3>
+        <p>Local co-op, campaigns, mod-friendly worlds. It accumulates a shared history with
+          you across a session, argues about strategy, develops favorite tactics, and
+          occasionally saves you — and occasionally does not. The framing is closer to
+          <i>"I gave an AI a controller and taught it how to play"</i> than to a bot that
+          beats a game for you.</p>
+        <p class="note dim">Not built for ranked competitive multiplayer, and not intended for
+          it. This is for private matches, co-op, campaigns, local play — the parts of gaming
+          that are about the people (or the teammate) in the room with you.</p>
+      </div>
+      <div class="use-card bench">
+        <span class="tag">Benchmark</span>
+        <h3>A motor cortex for evaluating agents</h3>
+        <p>Screen capture, a virtual Xbox pad, one shared clock, a deadman safety boundary, and
+          a recorder that logs what the controller <i>actually did</i> — not what a model
+          proposed. Point any vision-capable model at it through <code>IFastPolicy</code> and
+          you get a real perception-to-action harness with no game-specific glue to write.</p>
+        <p class="note dim">Transport is the real cost. One decision through a CLI-shelled
+          agent runs ~12.5k tokens before a single pixel is added — a downscaled JPEG frame is
+          nearly free by comparison. Full numbers in <a href="STORAGE.md">docs/STORAGE.md</a>.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">The body, not the brain</p>
+      <h2>Eyes. Hands. Ears. Voice. Memory.</h2>
+      <p class="lede-block dim">Every capability maps to a channel a human player already has.
+        None of it knows what game it's in — game understanding lives entirely in the model
+        sitting behind these channels.</p>
+    </div>
+    <div class="anatomy-grid">
+      <div class="anatomy-item">
+        <div class="label">Eyes</div>
+        <p>Windows Graphics Capture into a ring buffer, downscaled and perceptually
+          deduplicated before anything reads it.</p>
+        <span class="pill done">done</span>
+      </div>
+      <div class="anatomy-item">
+        <div class="label">Hands</div>
+        <p>A virtual Xbox pad over ViGEm. One thread is the sole writer, always — nothing else
+          touches the device.</p>
+        <span class="pill done">done</span>
+      </div>
+      <div class="anatomy-item">
+        <div class="label">Ears</div>
+        <p>Game audio and microphone input, timestamped on the same clock as everything else.</p>
+        <span class="pill planned">planned</span>
+      </div>
+      <div class="anatomy-item">
+        <div class="label">Voice</div>
+        <p>Local faster-whisper and Piper for the loop that must never stall; a cloud model for
+          the words themselves. Opt-in — nothing in core imports it.</p>
+        <span class="pill planned">planned</span>
+      </div>
+      <div class="anatomy-item">
+        <div class="label">Memory</div>
+        <p>SQLite plus model-curated rules — what it learned about a game and about playing
+          with you, kept across sessions.</p>
+        <span class="pill planned">planned</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">No game-specific knowledge in the runtime</p>
+      <h2>The hard constraint</h2>
+    </div>
+    <div class="constraint">
+      <p class="quote">There is no <code>heal_party()</code>. No <code>seek_cover()</code>. No
+        <code>aim_at_enemy()</code>. The lowest abstraction the runtime knows is the human input
+        device: make the pad have these states at these times.</p>
+      <p class="dim" style="max-width:60ch;">Facts about a specific game — which window to
+        capture, that <code>controller-x</code> mines in Factorio, that <code>^/</code> is a
+        forbidden chat prefix — live in a profile TOML file, never in code. A test greps the
+        entire runtime for game names on every change. It has already caught three real leaks.
+        The question for every new piece of code is the same one: could this run unmodified in
+        Factorio, Baldur's Gate 3, and a game that doesn't exist yet?</p>
+    </div>
+  </section>
+
+  <section id="architecture" class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Five threads, one queue, one bus</p>
+      <h2>Nothing cognitive can stall the hands</h2>
+      <p class="lede-block dim">Cognition only ever <i>submits</i>. A dedicated scheduler
+        thread is the only thing that ever writes to the controller, which is what makes
+        "it keeps moving while it talks" true by construction — not by hope.</p>
+    </div>
+
+    <div class="diagram-wrap">
+      <svg viewBox="0 0 960 400" role="img" aria-label="Architecture diagram: Capture feeds Fast Policy; Fast Policy and Conversation submit action chunks into a command queue; the Scheduler drains that queue and is the sole writer to the Controller; the Scheduler emits events onto an event bus, which the Recorder drains and which feeds executed history back to Fast Policy and Conversation.">
+            <defs>
+              <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+              </marker>
+              <marker id="arrowAccent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)"/>
+              </marker>
+            </defs>
+
+            <!-- boxes -->
+            <g font-family="IBM Plex Mono, monospace" font-size="13">
+              <rect x="20" y="30" width="150" height="54" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"/>
+              <text x="95" y="62" text-anchor="middle" fill="currentColor">Capture</text>
+
+              <rect x="20" y="140" width="150" height="54" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"/>
+              <text x="95" y="172" text-anchor="middle" fill="currentColor">Fast Policy</text>
+
+              <rect x="20" y="250" width="150" height="54" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"/>
+              <text x="95" y="282" text-anchor="middle" fill="currentColor">Conversation</text>
+
+              <rect x="300" y="140" width="150" height="54" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"/>
+              <text x="375" y="172" text-anchor="middle" fill="currentColor">Command queue</text>
+
+              <rect x="560" y="132" width="190" height="70" rx="8" fill="none" stroke="var(--accent)" stroke-width="2"/>
+              <text x="655" y="162" text-anchor="middle" fill="var(--accent)" font-weight="600">Scheduler</text>
+              <text x="655" y="180" text-anchor="middle" fill="var(--accent)" font-size="10.5">sole writer, 120Hz tick</text>
+
+              <rect x="840" y="140" width="100" height="54" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"/>
+              <text x="890" y="172" text-anchor="middle" fill="currentColor">Pad</text>
+
+              <rect x="560" y="300" width="150" height="54" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"/>
+              <text x="635" y="332" text-anchor="middle" fill="currentColor">Event bus</text>
+
+              <rect x="800" y="300" width="140" height="54" rx="6" fill="none" stroke="currentColor" stroke-opacity="0.5"/>
+              <text x="870" y="332" text-anchor="middle" fill="currentColor">Recorder</text>
+            </g>
+
+            <!-- arrows -->
+            <g stroke="currentColor" stroke-opacity="0.6" fill="none">
+              <line x1="95" y1="84" x2="95" y2="140" marker-end="url(#arrow)"/>
+              <line x1="170" y1="167" x2="300" y2="167" marker-end="url(#arrow)"/>
+              <line x1="170" y1="270" x2="300" y2="190" marker-end="url(#arrow)"/>
+              <line x1="450" y1="167" x2="560" y2="167" marker-end="url(#arrow)"/>
+              <line x1="635" y1="202" x2="635" y2="300" marker-end="url(#arrow)"/>
+              <line x1="710" y1="327" x2="800" y2="327" marker-end="url(#arrow)"/>
+              <path d="M560,340 C 260,360 60,340 88,304" stroke-dasharray="4 4" marker-end="url(#arrow)"/>
+            </g>
+            <line x1="750" y1="167" x2="840" y2="167" stroke="var(--accent)" stroke-width="2.5" marker-end="url(#arrowAccent)"/>
+
+            <g font-family="IBM Plex Mono, monospace" font-size="10.5" fill="currentColor" fill-opacity="0.75">
+              <text x="105" y="115" text-anchor="middle">frames</text>
+              <text x="230" y="158" text-anchor="middle">submits</text>
+              <text x="220" y="240" text-anchor="middle">submits</text>
+              <text x="500" y="158" text-anchor="middle">drains</text>
+              <text x="750" y="255" text-anchor="middle">emits</text>
+              <text x="755" y="318" text-anchor="middle">drains</text>
+              <text x="300" y="368" text-anchor="middle" fill="var(--accent)" fill-opacity="1">executed history, never proposals</text>
+            </g>
+            <text x="795" y="152" font-family="IBM Plex Mono, monospace" font-size="10.5" fill="var(--accent)" text-anchor="middle">writes</text>
+        </svg>
+      </div>
+
+    <ol class="invariants">
+      <li><b>The scheduler is the sole writer to the controller.</b> Everything else submits through its queue.</li>
+      <li><b>A new chunk resolves against neutral, not live state.</b> Anything it doesn't mention gets released — nothing inherits a held stick by accident.</li>
+      <li><b>Absent is not empty.</b> <code>buttons=None</code> inherits; <code>buttons=frozenset()</code> releases everything.</li>
+      <li><b>One clock.</b> Everything timestamps from <code>player2.clock</code>; audio drifts against measured sample count, never arrival time.</li>
+      <li><b>The recorder captures what happened,</b> not what was proposed. Proposals get preempted, rejected, and overridden constantly.</li>
+      <li><b>MCP is the control plane, never the servo bus.</b> Frames and action chunks never travel over it.</li>
+      <li><b>Voice is opt-in.</b> Nothing in core imports <code>player2.audio</code>.</li>
+      <li><b>Silence means stop.</b> No fresh chunk, no held input — the deadman always wins.</li>
+    </ol>
+  </section>
+
+  <section id="status" class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Milestone 1 — reached 2026-08-09</p>
+      <h2>A real game, a real controller, on the record</h2>
+      <p class="lede-block dim">An agent process manipulated a live copy of Factorio 2.0.7
+        through the same virtual-pad path a human uses — no API, no memory reading, no
+        injection. In the recorded run: 6 chunks accepted, 5 preemptions as each new intent
+        replaced the last, and the deadman releasing the pad at 6706ms the moment the agent
+        went quiet. The property that matters most held in a real game, not just in tests.</p>
+    </div>
+
+    <table class="subsystems">
+      <thead><tr><th>Subsystem</th><th>State</th></tr></thead>
+      <tbody>
+        <tr><td>Clock &amp; action-chunk contracts</td><td>Done, hardened</td></tr>
+        <tr><td>Motor system — scheduler, virtual pad</td><td>Done, hardened, verified on hardware</td></tr>
+        <tr><td>Profiles — game facts as config</td><td>Done</td></tr>
+        <tr><td>Window find / focus</td><td>Done</td></tr>
+        <tr><td>Eyes — capture, ring buffer, fingerprint</td><td>Done, hardened</td></tr>
+        <tr><td>Recorder — synchronized demonstrations</td><td>Done, hardened</td></tr>
+        <tr><td>Agent seam — Observation, policy, loop</td><td>Done, hardened</td></tr>
+        <tr><td>Direct SDK transport — Anthropic, OpenAI, CLI, Ollama</td><td>Done, not yet live-tested</td></tr>
+        <tr><td>Budget governor — token-rate degrade ladder</td><td>Done, not yet live-tested</td></tr>
+        <tr><td>Keyboard / mouse + text entry</td><td>Planned</td></tr>
+        <tr><td>Ears, voice, memory, MCP control plane</td><td>Planned</td></tr>
+      </tbody>
+    </table>
+
+    <div class="stat-row">
+      <div class="stat"><div class="n">414</div><div class="l">tests, stable across repeat runs</div></div>
+      <div class="stat"><div class="n">120Hz</div><div class="l">scheduler tick rate</div></div>
+      <div class="stat"><div class="n">0</div><div class="l">game names inside player2/</div></div>
+      <div class="stat"><div class="n">strict</div><div class="l">mypy, clean ruff</div></div>
+    </div>
+  </section>
+
+  <section id="process" class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Built by adversarial review, not vibes</p>
+      <h2>Every line has an author and a reviewer</h2>
+    </div>
+
+    <div class="roles">
+      <div class="role">
+        <div class="who">Claude — lead engineer</div>
+        <p>Owns architecture, the tests, the final diff, and validation. Writes the test file
+          <i>first, always</i> — it becomes the spec the implementer works against, not
+          documentation written after the fact.</p>
+      </div>
+      <div class="role">
+        <div class="who">Codex — consultant</div>
+        <p>Three tiers routed by stakes: cheap and tightly-specified work, a default
+          implementer, and an escalation for concurrency, lifetimes, and anything that must be
+          released correctly. Implements against Claude's tests, or reviews a diff — never
+          told which model wrote it.</p>
+      </div>
+    </div>
+
+    <p class="dim" style="margin-top:28px; max-width:64ch;">Every finding gets adjudicated —
+      reproduced, or rejected with a one-line reason — and every round is logged with its token
+      cost in <a href="DEV-PROCESS.md">docs/DEV-PROCESS.md</a>. That log is treated as a
+      deliverable, not overhead: the goal is a routing policy backed by real numbers instead of
+      vendor benchmarks.</p>
+
+    <div class="findings">
+      <div class="finding">"Unit 2 passed 194/194 with strict types and clean lint — and still
+        had four critical defects that could strand a held controller. A green suite is
+        evidence about the tests, not the code."</div>
+      <div class="finding">"Sol/high found four criticals in Terra's scheduler code, invisible
+        to the full green suite, on two separate units. Anything touching threads, locks, or a
+        resource that must be released gets routed there regardless of diff size."</div>
+      <div class="finding">"The worst bug of the project lived in no diff at all: a virtual
+        controller destroyed and recreated on every CLI run, which the game reads as a
+        controller unplugging — and titles with console ports pause when that happens. Found
+        by a human watching the real system, not by review."</div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="wrap">
+  <div class="foot-grid">
+    <div>
+      <h4>Quickstart</h4>
+      <pre><code>pip install -e ".[dev]"
+python -m pytest
+
+python -m player2.demo session \
+    --profile profiles/factorio.toml</code></pre>
+      <p class="dim" style="font-size:13.5px; margin-top:14px;">Requires Windows, Python 3.12,
+        and <a href="https://github.com/nefarius/ViGEmBus">ViGEmBus</a>. Works with any
+        controller-capable game — Factorio 2.0 is the first target.</p>
+    </div>
+    <div>
+      <h4>Documentation</h4>
+      <ul>
+        <li><a href="CARRYOVER.md">Project state (start here)</a></li>
+        <li><a href="DEV-PROCESS.md">Dev process log</a></li>
+        <li><a href="PLATFORM-NOTES.md">Platform notes</a></li>
+        <li><a href="STORAGE.md">Storage &amp; transport cost</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Project</h4>
+      <ul>
+        <li><a href="https://github.com/spilloid/player-2">Source on GitHub</a></li>
+        <li><a href="https://github.com/spilloid/player-2/blob/main/LICENSE">MIT License</a></li>
+        <li><a href="https://github.com/spilloid/player-2/blob/main/CLAUDE.md">Working agreement</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="foot-note">
+    <span>© 2026 Joseph Spillers. MIT licensed.</span>
+    <span>Built for private matches, co-op, campaigns, local and mod-friendly play — not for ranked competitive multiplayer.</span>
+  </div>
+</footer>
+
+<script>
+  (function () {
+    var stored = null;
+    try { stored = localStorage.getItem("player2-theme"); } catch (e) {}
+    if (stored === "light" || stored === "dark") {
+      document.documentElement.setAttribute("data-theme", stored);
+    }
+    var btn = document.getElementById("themeToggle");
+    btn.addEventListener("click", function () {
+      var prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+      var current = document.documentElement.getAttribute("data-theme") || (prefersDark ? "dark" : "light");
+      var next = current === "dark" ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", next);
+      try { localStorage.setItem("player2-theme", next); } catch (e) {}
+    });
+  })();
+</script>
+</body>
+</html>

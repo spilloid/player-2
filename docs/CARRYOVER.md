@@ -84,13 +84,30 @@ python -m player2.demo readback                                   # is the pad r
 
 ## 3. Environment facts you cannot guess
 
-- Dev machine is a **Surface Laptop 4**: i7-1185G7, **Iris Xe, no discrete GPU**, 16GB. The
-  "fast" policy is not fast here and the docs must keep saying so.
-- **ViGEmBus is installed and running**; `vgamepad` binds to it. Virtual pad appears on
-  XInput slot 0.
-- Target game: **Factorio: Space Age 2.0.7**, `C:\Games\Factorio\bin\x64\factorio.exe`.
-  `input-method=game-controller` has been set in `%APPDATA%\Factorio\config\config.ini`
-  (backup at `config.ini.player2-backup`). **Factorio must be closed when editing that file**
+> **Machine transition in progress as of 2026-08-13.** Everything below this note describes
+> the Surface Laptop 4 this project was built on through Unit 8 and both live-verification
+> passes. Joey is moving the work to a separate gaming PC — likely exactly the "gaming rig"
+> roadmap item 7 already anticipated for GPU-accelerated local inference. **A fresh session on
+> the new machine must re-verify every fact below, not assume it carries over**: CPU/GPU/RAM,
+> whether ViGEmBus is installed, whether Factorio is installed and at what path, and whether
+> Ollama is installed with which models pulled. None of that is guessable from this file.
+> Redo the setup checklist in §9 below on the new machine before trusting anything that
+> depends on it (live gameplay, `demo.py agent`, Ollama's OpenAI-compatible transport).
+
+- Dev machine **was** a **Surface Laptop 4**: i7-1185G7, **Iris Xe, no discrete GPU**, 16GB.
+  The "fast" policy was not fast there — confirmed directly, not just assumed, by the
+  2026-08-13 live Ollama runs (25s–180s+ per decision on an 8B vision+tools model). Update
+  this line with the new machine's real specs once known; do not keep citing Surface Laptop
+  numbers as if they still apply.
+- **ViGEmBus is installed and running** *on the Surface Laptop*; `vgamepad` binds to it.
+  Virtual pad appears on XInput slot 0 there. **Unverified on the new machine** — ViGEmBus is
+  a per-machine driver install, not something that travels with the repo.
+- Target game: **Factorio: Space Age 2.0.7**, was at `C:\Games\Factorio\bin\x64\factorio.exe`
+  *on the Surface Laptop*. **The install path (or whether Factorio is installed at all) on
+  the new machine is unknown.** `input-method=game-controller` has been set in
+  `%APPDATA%\Factorio\config\config.ini` (backup at `config.ini.player2-backup`) — that is a
+  per-user Factorio config, so it needs to be set again on the new machine's own
+  `%APPDATA%\Factorio\config\config.ini`. **Factorio must be closed when editing that file**
   — it rewrites it on exit.
 - Codex CLI lives at `%APPDATA%\npm\codex.cmd` and is **not on the Bash tool's PATH**, only
   PowerShell's. There is **no `--reasoning-effort` flag**; use `-c model_reasoning_effort=`.
@@ -189,15 +206,42 @@ full coding-agent scaffold per invocation. One decision every 2s ⇒ ~1.9M token
 
 ## 7. Next steps, in order
 
-1. **Direct SDK transport** — the 10x, and the thing standing between us and a Luna-driven v1.
-   Install the real `openai`/`anthropic` packages instead of shelling out. Build it behind
-   `IDeliberativeModel`/`IFastPolicy` so the CLI adapter stays as a zero-credential fallback.
-2. **Budget governor** — tokens-per-minute cap that *degrades* rather than stopping: lengthen
-   the chunk horizon, raise the change threshold, drop frames per observation, and finally hand
-   control back with an explicit event. Belongs conceptually next to the deadman; both are
-   "fail safe when a resource runs out." Joey's explicit concern: *do not cost a user their
-   whole usage window in five minutes of play.*
-3. **Wire the perceptual gate into `AgentLoop`** (smallest of the three levers, still worth it).
+1. ~~**Direct SDK transport**~~ — **done** (`docs/DEV-PROCESS.md` Unit 7). `player2/agent/`
+   gained `model_schema.py` + `model_policy.py` (a provider-neutral `SDKPolicy` behind an
+   injectable `IModelTransport` seam) and three transports: `anthropic_transport.py`,
+   `openai_transport.py` (optional import, `pip install -e .[models]`), and
+   `cli_transport.py` (the `codex exec` fallback CARRYOVER called for, zero credentials
+   needed). `SDKPolicy` reuses `contracts.chunk_from_dict` and `video.encode.{downscale,
+   encode_jpeg}` rather than a second validator or image pipeline. Not yet wired into
+   `AgentLoop` in a live session — that's config, not code, and is a natural first task for
+   whoever picks up step 2. Two things explicitly **not** done here, on purpose: `SDKPolicy`
+   does not shrink its timeout to the observation's remaining decision budget, and frame
+   preprocessing has no bound on count or memory. Both are step 2's job, not patched here.
+2. ~~**Budget governor**~~ — **done** (`docs/DEV-PROCESS.md` Unit 8), together with a 4th
+   transport requested mid-unit. `player2/agent/budget.py`: `BudgetGovernor` (rolling
+   tokens-per-minute window, NORMAL/DEGRADED/EXHAUSTED, non-sticky recovery) and
+   `GovernedTransport` (a transparent `IModelTransport` wrapper that feeds it — zero changes
+   needed to `SDKPolicy` or the three Unit 7 transports beyond one `last_usage` property
+   each). `AgentLoop` gained an optional `governor=` param; `governor=None` is byte-for-byte
+   the old behavior. `player2/agent/ollama_transport.py` (`OllamaTransport`, a thin
+   `OpenAITransport` subclass against Ollama's OpenAI-compatible endpoint) shipped in the
+   same unit. All four transports + the governor are now wired into `python -m player2.demo
+   agent` behind `--policy sdk --provider {anthropic,openai,cli,ollama} --budget-tpm N`; the
+   `agent_notes` field(profile.py) that step 1 anticipated is read from the profile and
+   becomes the SDK policy's goal. **Still not done, explicitly out of scope by review
+   adjudication:** true multi-caller admission control (the governor assumes one governed
+   call in flight at a time; two AgentLoops sharing one governor could both start expensive
+   calls before either is recorded) and the "raise the change threshold" lever, which needs
+   step 3 (the perceptual gate) to exist first. **Live-tested against real local Ollama on
+   2026-08-11** (see DEV-PROCESS.md Unit 8's live-verification note): connectivity, transport,
+   `SDKPolicy`, and the governor's failure-path accounting all confirmed working end-to-end.
+   The remaining gap narrowed to something specific: neither small model pulled on this
+   machine (`smollm2:1.7b` — tools but no vision; `moondream` — vision but no tools) can do
+   both halves of `propose()`'s job. **Anthropic and OpenAI remain completely untested against
+   real credentials** — nobody has set an API key yet.
+3. **Wire the perceptual gate into `AgentLoop`.** Smallest of the original three levers, and
+   now also what unblocks the "raise the change threshold" degrade step the governor
+   currently can't use.
 4. **Fix recorder frame ownership** (defect 1 above).
 5. **Keyboard/mouse adapter + text entry**, including in-game chat with the profile's opaque
    deny-pattern list (`^/` for Factorio, because its chat box is also a Lua console). Note:
@@ -208,6 +252,21 @@ full coding-agent scaffold per invocation. One decision every 2s ⇒ ~1.9M token
 7. **SmolVLM / Moondream on the gaming rig** — as a Luna *alternative* for the fast policy, not
    as a gate. The gate stays deterministic; a perceptual hash beats a tiny model at that job by
    four orders of magnitude.
+7b. ~~**Ollama transport**~~ — **done**, see item 2. Landed the same day it was requested
+   (Joey initially said "within months," then corrected to "not within months" mid-session —
+   see `docs/DEV-PROCESS.md` Unit 8). Live-tested the same day, sooner than planned, because
+   Joey installed Ollama and pulled a model unprompted. First result: neither `moondream`
+   (this transport's original shipped default — vision, no tools) nor `smollm2:1.7b` (tools,
+   no vision) could do the job. **Resolved 2026-08-13**: `hf.co/Qwen/Qwen3-VL-8B-Instruct-GGUF`
+   does both, confirmed against the real production schema and a real `Frame` — a complete,
+   valid `ActionChunk` came back through `SDKPolicy.propose()`. Now the shipped default.
+   Latency is real and not small: 25s–180s+ per decision on this CPU-only Surface Laptop 4,
+   nowhere near the ~1.5s fast-policy cadence — confirmed, not assumed, exploratory-use-only
+   for now. Along the way, hit and diagnosed an unrelated, unresolved Windows-specific Ollama
+   bug (`ollama/ollama#15074`, 401 on every new registry pull); worked around it by pulling
+   from Hugging Face directly (`ollama pull hf.co/<org>/<repo>`), which bypasses Ollama's own
+   registry entirely. Full account in `docs/DEV-PROCESS.md`'s 2026-08-13 live-verification
+   note.
 8. Segmented hardware-accelerated video (Quick Sync) — the remaining storage 10x.
 
 Also planned: **a GitHub docs page**, so keep documenting decisions in a form that lifts out.
@@ -223,3 +282,42 @@ Also planned: **a GitHub docs page**, so keep documenting decisions in a form th
   co-op, campaigns, local, mod-friendly environments.
 - Keep the DEV-PROCESS log honest, including where Claude was wrong. Several entries record
   exactly that and they are the most useful rows in the table.
+
+---
+
+## 9. Setup checklist for a new machine
+
+Nothing below is committed to the repo — it's per-machine state that has to be redone. Verify
+each one directly (probe, don't assume) before trusting anything that depends on it.
+
+1. **Python 3.12**, then `pip install -e ".[dev]"` from the repo root. Run `python -m pytest`
+   once, clean, before touching anything else — it should be ~560 tests, all green, stable
+   across 3 runs (`for i in 1 2 3; do python -m pytest -q; done`). If it isn't, something
+   about the new machine is different in a way that matters; find out before writing code.
+2. **ViGEmBus**: install from https://github.com/nefarius/ViGEmBus, then
+   `python -m player2.demo probe` — confirms Windows sees the virtual pad at all — followed by
+   `python -m player2.demo readback`, which drives all four stick directions and reads them
+   back through XInput with no game running. Both must pass before believing any game
+   integration issue is our code and not a missing/broken driver.
+3. **Factorio 2.0.7**, any install path. Set `input-method=game-controller` in that install's
+   own `%APPDATA%\Factorio\config\config.ini` (Factorio must be closed while editing — it
+   rewrites the file on exit). `python -m player2.demo capture --profile
+   profiles/factorio.toml --frames 6` is the fastest way to confirm the window is found and
+   frames actually arrive.
+4. **For local models (Ollama)**: install Ollama, then `ollama pull
+   hf.co/Qwen/Qwen3-VL-8B-Instruct-GGUF` (this transport's current default, confirmed working
+   — see §7b above and DEV-PROCESS.md's 2026-08-13 note). Use the `hf.co/...` form, not
+   Ollama's own library search, if `ollama pull <name>` from the regular registry starts
+   returning `401` — that's a known unresolved upstream bug
+   (`ollama/ollama#15074`), not a project or machine problem, and the Hugging Face path
+   sidesteps it entirely. A GPU changes the viability calculus here enormously: every latency
+   number in DEV-PROCESS's live-verification notes (25s–180s+ per decision) was measured
+   CPU-only. Re-measure on the new hardware before assuming it's still too slow for the fast
+   policy's ~1.5s cadence — that conclusion was hardware-specific, not a property of the model.
+5. **For cloud models (Anthropic/OpenAI)**: neither has been live-tested by this project at
+   all, on any machine, as of this writing. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` and
+   that path becomes available; nobody has done it yet, so treat the first live call as truly
+   first-of-its-kind, same caution as the Ollama live-verification passes got.
+6. **Codex CLI**: confirm `codex --version` works from PowerShell (not necessarily Bash — see
+   §3's note on PATH). Re-auth (`codex exec` prompts if needed) before routing any unit to
+   Terra/Sol/Luna.

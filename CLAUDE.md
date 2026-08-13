@@ -143,6 +143,10 @@ python -m player2.demo        # drive the attached game
 
 ## Environment notes
 
+> **Machine transition in progress as of 2026-08-13** — work is moving from the Surface Laptop
+> below to a separate gaming PC. Check `docs/CARRYOVER.md` §3 and §9 for current, re-verified
+> hardware facts and a setup checklist before trusting anything below as still true.
+
 - Dev machine is a Surface Laptop 4: i7-1185G7, **Iris Xe, no discrete GPU**, 16GB. The "fast"
   policy is not fast here and the docs must keep saying so until better hardware or a trained
   motor policy exists.
