@@ -23,6 +23,26 @@ wrap_macro = "toggle_pause"
 # enforces these patterns without knowing what "/" means.
 text_deny_patterns = ["^/", "^\\s*/"]
 
+# The runtime forwards this string into a model's prompt unread -- it never parses or acts
+# on it, same as every other field above. Bindings are Factorio's own controller DEFAULTS,
+# read directly from config.ini (shipped commented-out but active; see PLATFORM-NOTES.md #4),
+# not guessed. This is not a complete binding list, only what has actually been read there.
+agent_notes = """
+Controller bindings (Factorio's defaults, read from config.ini, not guessed):
+  move: left stick. mine or attack whatever is targeted: X. open a machine, chest, or
+  placed entity, and also place a held item: A. craft, inside a crafting menu: A.
+  open the inventory / character / crafting screen: Y. rotate a held item: D-pad right,
+  reverse: D-pad left. pick up the item under the cursor: D-pad down. cancel a held item
+  or pipette a recipe from an entity: B. confirm a GUI prompt: Y.
+  Pausing and closing a menu are handled by this profile's own macros, not raw buttons.
+
+Suggested objective, absent any goal a session sets explicitly: prioritize automating
+science pack production over any other activity. Mine and smelt the raw materials the
+current tech tier needs, build out the production chain, and research whatever the tech
+tree unlocks next. Treat combat and exploration as means to that end, not goals in
+themselves.
+"""
+
 # RT is brought fully down BEFORE START is pressed, because analog channels interpolate
 # between keyframes -- pressing both at t=0 would send START while the trigger was still
 # ramping, and the chord might not register.

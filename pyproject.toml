@@ -14,6 +14,12 @@ dev = ["pytest", "ruff", "mypy"]
 # so a machine that never installs this group pays nothing for it -- no model
 # weights, no audio backends, no import cost. Install with: pip install -e .[voice]
 voice = ["faster-whisper", "piper-tts", "sounddevice"]
+# Direct SDK transport for model-backed policies. Nothing in player2.agent.base or
+# player2.agent.loop imports these -- only the concrete transport modules do, and each
+# transport also accepts an injected client so tests never need the package installed.
+# The CLI transport (codex exec) needs neither package and is the zero-credential fallback.
+# Install with: pip install -e .[models]
+models = ["anthropic", "openai"]
 
 [tool.ruff]
 line-length = 100

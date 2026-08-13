@@ -55,6 +55,7 @@ class TestLoading:
         assert p.wrap_macro is None
         assert p.window_title_contains is None
         assert p.text_deny_patterns == ()
+        assert p.agent_notes is None
 
     def test_reads_optional_fields(self, tmp_path: Path) -> None:
         text = MINIMAL + """
@@ -66,6 +67,18 @@ text_deny_patterns = ["^/", "^!"]
         assert p.wrap_macro == "wave"
         assert p.window_title_contains == "Demo Game"
         assert p.text_deny_patterns == ("^/", "^!")
+
+    def test_reads_agent_notes(self, tmp_path: Path) -> None:
+        """agent_notes is where control-binding facts belong -- the runtime forwards this
+        string into a model's prompt unread, exactly like every other profile field; it must
+        never be interpreted, only transported. See TestRuntimeStaysGameAgnostic below."""
+        text = MINIMAL + '\nagent_notes = "controller-x mines the targeted resource"\n'
+        p = load_profile(write(tmp_path, text))
+        assert p.agent_notes == "controller-x mines the targeted resource"
+
+    def test_agent_notes_must_be_a_string(self, tmp_path: Path) -> None:
+        with pytest.raises(InvalidProfile):
+            load_profile(write(tmp_path, MINIMAL + "\nagent_notes = 5\n"))
 
     def test_missing_file_is_an_invalid_profile(self, tmp_path: Path) -> None:
         with pytest.raises(InvalidProfile):
@@ -159,6 +172,15 @@ class TestFactorioProfile:
     def test_denies_the_console_prefix(self) -> None:
         """Factorio's chat box is also its Lua console."""
         assert "^/" in load_profile(FACTORIO).text_deny_patterns
+
+    def test_agent_notes_document_the_real_default_bindings(self) -> None:
+        """These strings are read from config.ini's DEFAULT controller bindings (Factorio ships
+        them commented-out but active), not guessed -- see PLATFORM-NOTES.md #4. A model with
+        no notion of which button mines has no way to act on any goal beyond walking around."""
+        notes = load_profile(FACTORIO).agent_notes
+        assert notes is not None
+        assert "mine" in notes.lower() and "X" in notes
+        assert "left stick" in notes.lower() or "left_stick" in notes.lower()
 
 
 class TestRuntimeStaysGameAgnostic:

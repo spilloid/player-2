@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol
 
 from player2.agent.base import IFastPolicy, Observation
+from player2.agent.budget import BudgetDecision, IBudgetGovernor
 from player2.clock import Clock
 from player2.contracts import ActionChunk, Frame
 from player2.control.scheduler import Scheduler, SchedulerEvent
@@ -48,6 +49,7 @@ class AgentStats:
     chunks_rejected: int
     policy_errors: int
     events_seen: int
+    budget_skips: int
     last_error: str | None
 
 
@@ -69,8 +71,24 @@ class AgentLoop:
         recorder: _Recorder | None = None,
         min_interval_ms: float = _DEFAULT_MIN_INTERVAL_MS,
         frames_per_observation: int = _DEFAULT_FRAMES_PER_OBSERVATION,
+        governor: IBudgetGovernor | None = None,
     ) -> None:
-        """Prepare an idle loop with bounded history and caller-owned dependencies."""
+        """Prepare an idle loop with bounded history and caller-owned dependencies.
+
+        When `governor` is given, `min_interval_ms` and `frames_per_observation` above stop
+        controlling cadence -- every cycle instead uses the governor's own `decide()` result,
+        so configure cadence through the governor's `base_interval_ms`/
+        `base_frames_per_observation` instead. Nothing here enforces the two configurations
+        agree; a governor built with different base values than these constructor arguments
+        will silently win, with no error raised. A governor's cadence transition can also lag
+        by up to one stale interval after a level change -- `_run` re-evaluates `decide()`
+        every iteration, but the wait gate for the CURRENT cycle was already set from the
+        PREVIOUS cycle's interval, so a level change takes full effect on the cycle after it
+        is first observed, not the one it is first observed on. Both are accepted, documented
+        limitations, not defects pending a fix: the loop's own timing gate is a hardened,
+        already-reviewed hot path, and this cadence lag is bounded and non-unsafe (the deadman
+        still governs the pad regardless of cognition's cadence).
+        """
         if isinstance(min_interval_ms, bool) or not isinstance(min_interval_ms, (int, float)):
             raise ValueError("min_interval_ms must be a positive finite number")
         interval_ms = float(min_interval_ms)
@@ -91,6 +109,7 @@ class AgentLoop:
         self._recorder = recorder
         self._min_interval_ms = interval_ms
         self._frames_per_observation = frames_per_observation
+        self._governor = governor
         self._history: deque[SchedulerEvent] = deque(maxlen=_HISTORY_CAPACITY)
         self._history_lock = threading.Lock()
         self._next_decision_seq = self._scheduler_next_decision_seq()
@@ -106,6 +125,7 @@ class AgentLoop:
         self._chunks_rejected = 0
         self._policy_errors = 0
         self._events_seen = 0
+        self._budget_skips = 0
         self._last_error: str | None = None
 
     def start(self) -> None:
@@ -156,6 +176,7 @@ class AgentLoop:
                 chunks_rejected=self._chunks_rejected,
                 policy_errors=self._policy_errors,
                 events_seen=self._events_seen,
+                budget_skips=self._budget_skips,
                 last_error=self._last_error,
             )
 
@@ -164,7 +185,15 @@ class AgentLoop:
         next_decision_ms: float | None = None
         try:
             while not self._stop_event.is_set():
-                frames = self._video.latest(self._frames_per_observation)
+                decision: BudgetDecision | None = None
+                if self._governor is None:
+                    interval_ms = self._min_interval_ms
+                    frames_per_observation = self._frames_per_observation
+                else:
+                    decision = self._governor.decide()
+                    interval_ms = decision.min_interval_ms
+                    frames_per_observation = decision.frames_per_observation
+                frames = self._video.latest(frames_per_observation)
                 self._record_new_frames(frames)
                 if not frames:
                     self._stop_event.wait(_IDLE_POLL_SECONDS)
@@ -176,8 +205,11 @@ class AgentLoop:
                     self._stop_event.wait(min(_IDLE_POLL_SECONDS, remaining_seconds))
                     continue
 
-                next_decision_ms = now_ms + self._min_interval_ms
-                self._decide(frames, now_ms)
+                next_decision_ms = now_ms + interval_ms
+                if decision is not None and not decision.should_propose:
+                    self._increment("budget_skips")
+                    continue
+                self._decide(frames, now_ms, interval_ms)
         except BaseException as error:
             self._set_last_error(error)
 
@@ -195,7 +227,7 @@ class AgentLoop:
             except BaseException as error:
                 self._set_last_error(error)
 
-    def _decide(self, frames: tuple[Frame, ...], now_ms: float) -> None:
+    def _decide(self, frames: tuple[Frame, ...], now_ms: float, interval_ms: float) -> None:
         """Stamp one causal observation before slow policy work can make its epoch stale."""
         cutoff_ms = max(frame.session_ms for frame in frames)
         decision_seq = self._next_decision_seq
@@ -208,7 +240,7 @@ class AgentLoop:
             goal=self._goal,
             history=history,
             observation_cutoff_ms=cutoff_ms,
-            deadline_ms=now_ms + self._min_interval_ms,
+            deadline_ms=now_ms + interval_ms,
             epoch=epoch,
             decision_seq=decision_seq,
         )
@@ -301,6 +333,8 @@ class AgentLoop:
                 self._chunks_rejected += 1
             elif counter == "policy_errors":
                 self._policy_errors += 1
+            elif counter == "budget_skips":
+                self._budget_skips += 1
 
     def _set_last_error(self, error: BaseException) -> None:
         """Expose daemon-worker death because silent cognition loss leaves no safe witness."""

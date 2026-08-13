@@ -305,14 +305,61 @@ def spiral_chunks(segments: int = 28, base_ms: float = 700.0,
     return chunks
 
 
+_SDK_BASE_INTERVAL_MS = 1500.0
+_SDK_FRAMES_PER_OBSERVATION = 1
+
+
+def _build_sdk_policy(
+    provider: str, model: str | None, budget_tpm: float, clock: object, agent_notes: str | None,
+) -> tuple[object, object, str | None]:
+    """Build a governed SDKPolicy for the requested provider.
+
+    Every one of these transports still carries its own module docstring's caveat: real
+    behavior against a live API has not been verified by this project yet (see
+    docs/DEV-PROCESS.md Units 7 and 8). This is the first place that caveat becomes reachable
+    from the command line rather than only from a test's fake client.
+    """
+    from player2.agent.budget import BudgetGovernor, GovernedTransport
+    from player2.agent.model_policy import IModelTransport, SDKPolicy
+
+    transport: IModelTransport
+    if provider == "anthropic":
+        from player2.agent.anthropic_transport import AnthropicTransport
+        transport = AnthropicTransport(model=model) if model else AnthropicTransport()
+    elif provider == "openai":
+        from player2.agent.openai_transport import OpenAITransport
+        transport = OpenAITransport(model=model) if model else OpenAITransport()
+    elif provider == "ollama":
+        from player2.agent.ollama_transport import OllamaTransport
+        transport = OllamaTransport(model=model) if model else OllamaTransport()
+    else:
+        from player2.agent.cli_transport import CLITransport
+        transport = CLITransport(model=model) if model else CLITransport()
+
+    governor = BudgetGovernor(
+        tokens_per_minute_limit=budget_tpm,
+        base_interval_ms=_SDK_BASE_INTERVAL_MS,
+        base_frames_per_observation=_SDK_FRAMES_PER_OBSERVATION,
+        clock=clock,  # type: ignore[arg-type]
+    )
+    governed = GovernedTransport(inner=transport, governor=governor)
+    policy = SDKPolicy(transport=governed)
+    goal = agent_notes if agent_notes else "Play the game shown in the frames."
+    return policy, governor, goal
+
+
 def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
-          pattern: str = "square", warmup: str | None = None) -> int:
+          pattern: str = "square", warmup: str | None = None, policy_kind: str = "scripted",
+          provider: str = "anthropic", model: str | None = None,
+          budget_tpm: float = 60_000.0) -> int:
     """The whole loop, end to end: see the game, decide, act, and record all of it.
 
     Capture -> policy -> action chunk -> scheduler -> virtual pad -> game, with every frame,
     every executed pad state, and every scheduler event written to a session directory on
-    one clock. The policy here is a scripted stand-in, but nothing else is: this is the
-    exact path a real model will run through.
+    one clock. `policy_kind="scripted"` (the default) is a deterministic stand-in that needs
+    no credentials; `policy_kind="sdk"` runs a real model behind the same seam, governed by a
+    token-rate budget so it degrades cadence rather than running unbounded. Nothing else in
+    this function's path differs between the two -- that is the point of the seam.
     """
     from player2.agent.fast_stub import ScriptedPolicy
     from player2.agent.loop import AgentLoop
@@ -338,7 +385,8 @@ def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
         metadata={
             "profile": profile.name if profile else None,
             "window_title": target.title,
-            "policy": "scripted",
+            "policy": policy_kind,
+            "provider": provider if policy_kind == "sdk" else None,
         },
     )
     recorder.start()
@@ -358,17 +406,39 @@ def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
     scheduler = Scheduler(output=output, clock=clock, max_hold_ms=250.0)
     sched_thread = SchedulerThread(scheduler)
 
-    if pattern == "spiral":
+    governor = None
+    if policy_kind == "sdk":
+        print(f"SDK policy: provider={provider} budget={budget_tpm:g} tok/min "
+              "-- UNVERIFIED against a live API by this project yet; watch the first "
+              "few decisions closely (see docs/DEV-PROCESS.md Units 7-8)")
+        try:
+            sdk_policy, governor, goal = _build_sdk_policy(
+                provider, model, budget_tpm, clock,
+                profile.agent_notes if profile else None,
+            )
+        except ImportError as error:
+            print(f"could not build the '{provider}' policy: {error}")
+            recorder.stop()
+            video.stop()
+            return 1
+        loop = AgentLoop(policy=sdk_policy, video=video, scheduler=scheduler,  # type: ignore[arg-type]
+                         clock=clock, goal=goal, recorder=recorder,
+                         min_interval_ms=_SDK_BASE_INTERVAL_MS,
+                         frames_per_observation=_SDK_FRAMES_PER_OBSERVATION,
+                         governor=governor)  # type: ignore[arg-type]
+    elif pattern == "spiral":
         chunks = spiral_chunks()
         goal, interval = "walk an expanding spiral over new ground", 700.0
+        loop = AgentLoop(policy=ScriptedPolicy(chunks), video=video, scheduler=scheduler,
+                         clock=clock, goal=goal, recorder=recorder, min_interval_ms=interval)
     else:
         chunks = [
             ActionChunk(keyframes=(Keyframe(t_ms=0.0, left_stick=v), Keyframe(t_ms=800.0)))
             for v in DIRECTIONS.values()
         ]
         goal, interval = "walk in a square", 800.0
-    loop = AgentLoop(policy=ScriptedPolicy(chunks), video=video, scheduler=scheduler,
-                     clock=clock, goal=goal, recorder=recorder, min_interval_ms=interval)
+        loop = AgentLoop(policy=ScriptedPolicy(chunks), video=video, scheduler=scheduler,
+                         clock=clock, goal=goal, recorder=recorder, min_interval_ms=interval)
 
     sched_thread.start()
     try:
@@ -392,10 +462,15 @@ def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
     stats = loop.stats
     capture_stats = video.stats
     print(f"\npolicy:   proposed={stats.chunks_proposed} accepted={stats.chunks_accepted} "
-          f"rejected={stats.chunks_rejected} errors={stats.policy_errors}")
+          f"rejected={stats.chunks_rejected} errors={stats.policy_errors} "
+          f"budget_skips={stats.budget_skips}")
     print(f"capture:  frames={capture_stats.frames_captured} "
           f"dropped={capture_stats.frames_dropped} errored={capture_stats.frames_errored}")
     print(f"events:   {stats.events_seen}")
+    if governor is not None:
+        budget_stats = governor.stats  # type: ignore[attr-defined]
+        print(f"budget:   level={budget_stats.level.value} "
+              f"tokens_in_window={budget_stats.tokens_in_window:g}")
     print(f"\nsession written to {recorder.directory}")
     print("  inspect with: python -m player2.demo replay --session " + str(recorder.directory))
     return 0
@@ -648,9 +723,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--recordings", default="recordings",
                         help="session root directory for 'agent'")
     parser.add_argument("--pattern", choices=["square", "spiral"], default="square",
-                        help="movement pattern for 'agent'")
+                        help="movement pattern for 'agent' when --policy scripted")
     parser.add_argument("--warmup", default=None,
                         help="macro to replay once before the loop starts, same pad session")
+    parser.add_argument("--policy", choices=["scripted", "sdk"], default="scripted",
+                        help="'scripted' needs no credentials; 'sdk' runs a real governed "
+                             "model policy for 'agent'")
+    parser.add_argument("--provider", choices=["anthropic", "openai", "cli", "ollama"],
+                        default="anthropic", help="model transport for --policy sdk")
+    parser.add_argument("--model", default=None,
+                        help="model override for --policy sdk (provider-specific default "
+                             "otherwise)")
+    parser.add_argument("--budget-tpm", type=float, default=60_000.0,
+                        help="tokens-per-minute cap for --policy sdk before it degrades "
+                             "cadence, then stops proposing")
     parser.add_argument("--direction", choices=sorted(DIRECTIONS), default="right",
                         help="direction for the 'hold' command")
     parser.add_argument("--seconds", type=float, default=1.0, help="seconds per side")
@@ -674,7 +760,7 @@ def main(argv: list[str] | None = None) -> int:
         return capture(args.profile, args.frames, args.out, delay)
     if args.command == "agent":
         return agent(args.profile, args.seconds, delay, args.recordings, args.pattern,
-                     args.warmup)
+                     args.warmup, args.policy, args.provider, args.model, args.budget_tpm)
     if args.command == "replay":
         if not args.session:
             parser.error("replay requires --session")

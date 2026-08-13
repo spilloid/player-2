@@ -23,6 +23,9 @@ class Profile:
 
     A copied, read-only macro mapping prevents a caller from changing actions after
     validation, which would otherwise turn load-time safety checks into a false promise.
+    `agent_notes` is free-text game facts (control bindings, terminology) forwarded into a
+    model's prompt verbatim -- the runtime never parses or acts on it, only transports it,
+    same as every other field here.
     """
 
     name: str
@@ -30,6 +33,7 @@ class Profile:
     wrap_macro: str | None = None
     window_title_contains: str | None = None
     text_deny_patterns: tuple[str, ...] = ()
+    agent_notes: str | None = None
 
     def __post_init__(self) -> None:
         """Detach the profile from caller-owned mappings while retaining value equality."""
@@ -117,4 +121,5 @@ def load_profile(path: str | os.PathLike[str]) -> Profile:
         "window_title_contains",
     )
     patterns = _read_patterns(_profile_option(data, raw_macros, "text_deny_patterns", []))
-    return Profile(name, macros, wrap_macro, window_title, patterns)
+    agent_notes = _string_field(_profile_option(data, raw_macros, "agent_notes"), "agent_notes")
+    return Profile(name, macros, wrap_macro, window_title, patterns, agent_notes)
