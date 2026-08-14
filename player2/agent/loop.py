@@ -24,6 +24,20 @@ _STOP_JOIN_SECONDS = 2.0
 _STOP_HANDOFF_SECONDS = 0.05
 
 
+def _describe(error: BaseException) -> str:
+    """Format an exception for a stats field without letting a broken `__str__` propagate.
+
+    An exception whose own formatting raises would otherwise escape whichever handler is
+    trying to report it -- turning a single bad policy response, which this module exists to
+    isolate, into an unhandled exception that kills the worker thread outright.
+    """
+    try:
+        detail = str(error)
+    except Exception:
+        detail = ""
+    return detail or type(error).__name__
+
+
 class _Recorder(Protocol):
     """Describe only the non-blocking recorder calls owned by the agent seam."""
 
@@ -51,6 +65,7 @@ class AgentStats:
     events_seen: int
     budget_skips: int
     last_error: str | None
+    last_policy_error: str | None
 
 
 class AgentLoop:
@@ -127,6 +142,7 @@ class AgentLoop:
         self._events_seen = 0
         self._budget_skips = 0
         self._last_error: str | None = None
+        self._last_policy_error: str | None = None
 
     def start(self) -> None:
         """Start cognition and one dedicated event drainer without duplicate witnesses."""
@@ -138,6 +154,7 @@ class AgentLoop:
             self._next_decision_seq = self._scheduler_next_decision_seq()
             with self._stats_lock:
                 self._last_error = None
+                self._last_policy_error = None
             self._event_thread = threading.Thread(target=self._run_events, daemon=True)
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._event_thread.start()
@@ -178,6 +195,7 @@ class AgentLoop:
                 events_seen=self._events_seen,
                 budget_skips=self._budget_skips,
                 last_error=self._last_error,
+                last_policy_error=self._last_policy_error,
             )
 
     def _run(self) -> None:
@@ -246,8 +264,8 @@ class AgentLoop:
         )
         try:
             proposal = self._policy.propose(observation)
-        except Exception:
-            self._increment("policy_errors")
+        except Exception as error:
+            self._record_policy_error(error)
             return
         if proposal is None or self._stop_event.is_set():
             return
@@ -331,14 +349,25 @@ class AgentLoop:
                 self._chunks_accepted += 1
             elif counter == "chunks_rejected":
                 self._chunks_rejected += 1
-            elif counter == "policy_errors":
-                self._policy_errors += 1
             elif counter == "budget_skips":
                 self._budget_skips += 1
 
+    def _record_policy_error(self, error: Exception) -> None:
+        """Keep the failure's detail instead of letting it vanish into an opaque counter.
+
+        Distinct from `_set_last_error`: that method reports a worker thread dying outright,
+        which is fatal to cognition. One flaky decision is not -- the loop keeps running, and a
+        caller checking `last_error` for "is the loop still alive" must not see a false alarm
+        from a single bad model response.
+        """
+        detail = _describe(error)
+        with self._stats_lock:
+            self._policy_errors += 1
+            self._last_policy_error = detail
+
     def _set_last_error(self, error: BaseException) -> None:
         """Expose daemon-worker death because silent cognition loss leaves no safe witness."""
-        detail = str(error) or type(error).__name__
+        detail = _describe(error)
         with self._stats_lock:
             self._last_error = detail
 

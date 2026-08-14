@@ -31,14 +31,59 @@ transport does not pull models itself.
 from __future__ import annotations
 
 import importlib
+import json
+import urllib.request
+from collections.abc import Callable
 from types import ModuleType
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from player2.agent.openai_transport import OpenAITransport
 
 _DEFAULT_BASE_URL = "http://localhost:11434/v1"
 _DEFAULT_MODEL = "hf.co/Qwen/Qwen3-VL-8B-Instruct-GGUF"
 _PLACEHOLDER_API_KEY = "ollama"
+_WARM_TIMEOUT_S = 120.0
+
+
+def _warm_payload(*, model: str, keep_alive: str | None) -> dict[str, Any]:
+    """Build the native generate request used to warm an Ollama model."""
+    payload: dict[str, Any] = {"model": model, "prompt": "", "stream": False}
+    if keep_alive is not None:
+        payload["keep_alive"] = keep_alive
+    return payload
+
+
+def _native_root(base_url: str) -> str:
+    """Reduce an OpenAI-compat base URL to scheme+host:port for Ollama's native API.
+
+    Ollama's native endpoints always live at the same host:port as the OpenAI-compat ones, just
+    under ``/api/...`` instead of whatever path the compat URL uses -- so the right move is to
+    discard the path entirely rather than string-strip a specific suffix. A suffix-based
+    approach (stripping ``/v1`` then a trailing slash) gets the common case right but silently
+    produces a wrong URL for a trailing-slash variant like ``.../v1/`` (the slash survives
+    unstripped, since the string no longer ends in exactly ``/v1``) -- a completely ordinary
+    shape to type or paste, and one this project's own local Ollama box's URL took the first
+    time it was entered.
+    """
+    parts = urlsplit(base_url)
+    return urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+
+
+def _ping_native_generate_endpoint(
+    base_url: str, model: str, keep_alive: str | None
+) -> None:
+    """Warm a model through Ollama's native API, which honors ``keep_alive``."""
+    root = _native_root(base_url)
+    payload = json.dumps(_warm_payload(model=model, keep_alive=keep_alive)).encode("utf-8")
+    request = urllib.request.Request(
+        f"{root}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=_WARM_TIMEOUT_S) as response:
+        response.read()
 
 
 def _optional_openai() -> ModuleType | None:
@@ -61,6 +106,8 @@ class OllamaTransport(OpenAITransport):
         client: Any | None = None,
         model: str = _DEFAULT_MODEL,
         base_url: str = _DEFAULT_BASE_URL,
+        keep_alive: str | None = None,
+        ping_native_api: Callable[[str, str, str | None], None] | None = None,
     ) -> None:
         if client is None:
             if openai is None:
@@ -73,3 +120,10 @@ class OllamaTransport(OpenAITransport):
                 base_url=base_url, api_key=_PLACEHOLDER_API_KEY, max_retries=0
             )
         super().__init__(client=client, model=model)
+        self._base_url = base_url
+        self._keep_alive = keep_alive
+        self._ping_native_api = ping_native_api or _ping_native_generate_endpoint
+
+    def warm(self) -> None:
+        """Pre-load the configured model through Ollama's native API."""
+        self._ping_native_api(self._base_url, self._model, self._keep_alive)

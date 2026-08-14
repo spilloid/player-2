@@ -12,3 +12,4 @@ recordings/
 *.sqlite
 .pytest-*/
 captures/
+.env

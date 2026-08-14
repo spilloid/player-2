@@ -180,3 +180,124 @@ class TestConstructionDefaults:
         monkeypatch.setattr(module, "openai", None)
         with pytest.raises(ImportError):
             OllamaTransport()
+
+
+class TestWarmPayload:
+    """Pure payload-building logic, tested without any network involved.
+
+    Confirmed live against a real server (docs/DEV-PROCESS.md) that Ollama's OpenAI-compatible
+    endpoint silently ignores a `keep_alive` field in the request body -- it isn't part of that
+    API surface, so `create()` never sends one. Only the native `/api/generate` endpoint honors
+    it, which is why `warm()` exists as a distinct call rather than a parameter threaded through
+    the inherited `complete_tool`/`complete_text`.
+    """
+
+    def test_omits_keep_alive_when_not_configured(self) -> None:
+        from player2.agent.ollama_transport import _warm_payload
+
+        payload = _warm_payload(model="m", keep_alive=None)
+        assert "keep_alive" not in payload
+        assert payload["model"] == "m"
+        assert payload["prompt"] == ""
+
+    def test_includes_keep_alive_when_configured(self) -> None:
+        from player2.agent.ollama_transport import _warm_payload
+
+        payload = _warm_payload(model="m", keep_alive="30m")
+        assert payload["keep_alive"] == "30m"
+
+
+class TestWarm:
+    """`warm()` is a distinct, explicitly-called method -- constructing a transport must never
+    perform network I/O on its own, so nothing here fires unless a caller asks for it."""
+
+    def test_delegates_to_the_injected_pinger_with_base_url_model_and_keep_alive(self) -> None:
+        calls: list[tuple[str, str, str | None]] = []
+        transport = OllamaTransport(
+            client=make_client(),
+            base_url="http://192.168.1.5:11434/v1",
+            model="a-model",
+            keep_alive="30m",
+            ping_native_api=lambda base_url, model, keep_alive: calls.append(
+                (base_url, model, keep_alive)
+            ),
+        )
+        transport.warm()
+        assert calls == [("http://192.168.1.5:11434/v1", "a-model", "30m")]
+
+    def test_passes_none_through_when_keep_alive_was_never_configured(self) -> None:
+        """warm() still pre-loads the model even with no explicit keep_alive -- avoiding the
+        cold-load tax on the first real decision does not require overriding the duration."""
+        calls: list[tuple[str, str, str | None]] = []
+        transport = OllamaTransport(
+            client=make_client(),
+            ping_native_api=lambda base_url, model, keep_alive: calls.append(
+                (base_url, model, keep_alive)
+            ),
+        )
+        transport.warm()
+        assert calls[0][2] is None
+
+    def test_default_pinger_hits_the_native_generate_endpoint_not_the_openai_compat_one(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import player2.agent.ollama_transport as module
+
+        requests: list[Any] = []
+
+        class _FakeResponse:
+            def __enter__(self) -> _FakeResponse:
+                return self
+
+            def __exit__(self, *args: Any) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def fake_urlopen(request: Any, timeout: float) -> _FakeResponse:
+            requests.append(request)
+            return _FakeResponse()
+
+        monkeypatch.setattr(module.urllib.request, "urlopen", fake_urlopen)
+        transport = OllamaTransport(
+            client=make_client(), base_url="http://192.168.1.5:11434/v1", keep_alive="30m",
+        )
+        transport.warm()
+        assert len(requests) == 1
+        assert requests[0].full_url == "http://192.168.1.5:11434/api/generate"
+        body = json.loads(requests[0].data)
+        assert body["keep_alive"] == "30m"
+        assert body["model"] == transport._model  # noqa: SLF001 -- verifying wiring, not API
+
+    def test_default_pinger_strips_a_trailing_slash_after_v1(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A base_url with a trailing slash (http://host:11434/v1/, a completely ordinary shape
+        to type or paste) must not survive into the native URL as .../v1/api/generate -- that
+        path does not exist on Ollama's native API, which lives at the same host:port under
+        /api/..., not nested under the OpenAI-compat /v1 prefix at all."""
+        import player2.agent.ollama_transport as module
+
+        requests: list[Any] = []
+
+        class _FakeResponse:
+            def __enter__(self) -> _FakeResponse:
+                return self
+
+            def __exit__(self, *args: Any) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def fake_urlopen(request: Any, timeout: float) -> _FakeResponse:
+            requests.append(request)
+            return _FakeResponse()
+
+        monkeypatch.setattr(module.urllib.request, "urlopen", fake_urlopen)
+        transport = OllamaTransport(
+            client=make_client(), base_url="http://192.168.1.5:11434/v1/", keep_alive="30m",
+        )
+        transport.warm()
+        assert requests[0].full_url == "http://192.168.1.5:11434/api/generate"

@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import math
+import os
 import sys
 import time
 from dataclasses import replace
@@ -35,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from player2.clock import SessionClock
+from player2.config import load_dotenv_file, resolve_runtime_config
 from player2.contracts import ActionChunk, Keyframe
 from player2.control.null import NullControllerAdapter
 from player2.control.scheduler import Scheduler, SchedulerThread
@@ -307,10 +309,16 @@ def spiral_chunks(segments: int = 28, base_ms: float = 700.0,
 
 _SDK_BASE_INTERVAL_MS = 1500.0
 _SDK_FRAMES_PER_OBSERVATION = 1
+# SDKPolicy's own default (10s) is sized for a fast cloud API, not a real decision against this
+# project's strict tool schema: docs/DEV-PROCESS.md Units 8-9 measured 9.6-65.1s for successful
+# real decisions, with one harder-schema attempt exceeding 180s. 90s clears every successful
+# measurement seen so far without chasing that one outlier.
+_SDK_TIMEOUT_S = 90.0
 
 
 def _build_sdk_policy(
     provider: str, model: str | None, budget_tpm: float, clock: object, agent_notes: str | None,
+    ollama_base_url: str | None = None, ollama_keep_alive: str | None = None,
 ) -> tuple[object, object, str | None]:
     """Build a governed SDKPolicy for the requested provider.
 
@@ -331,7 +339,29 @@ def _build_sdk_policy(
         transport = OpenAITransport(model=model) if model else OpenAITransport()
     elif provider == "ollama":
         from player2.agent.ollama_transport import OllamaTransport
-        transport = OllamaTransport(model=model) if model else OllamaTransport()
+        ollama_kwargs: dict[str, Any] = {}
+        if model:
+            ollama_kwargs["model"] = model
+        if ollama_base_url:
+            ollama_kwargs["base_url"] = ollama_base_url
+        if ollama_keep_alive:
+            ollama_kwargs["keep_alive"] = ollama_keep_alive
+        ollama_transport = OllamaTransport(**ollama_kwargs)
+        # Ollama's OpenAI-compatible endpoint silently ignores a keep_alive field in the
+        # request body (confirmed live, docs/DEV-PROCESS.md); only the native /api/generate
+        # endpoint honors it, and only warm() reaches that endpoint. Pre-loading here also
+        # avoids paying the cold-load tax (30s+, measured live) on the agent's first decision
+        # instead of only on whichever decision happens to arrive first. This is an
+        # optimization, not a correctness requirement -- the OpenAI-compat endpoint used for
+        # every real decision may work fine even when the native endpoint used only here does
+        # not, so a warm-up failure (OSError covers urllib's URLError/HTTPError/TimeoutError)
+        # must not crash the whole session or skip the caller's cleanup.
+        try:
+            ollama_transport.warm()
+        except OSError as error:
+            print(f"could not warm the Ollama model ahead of time: {error} -- continuing "
+                  "without it; the first real decision will pay any cold-load cost instead")
+        transport = ollama_transport
     else:
         from player2.agent.cli_transport import CLITransport
         transport = CLITransport(model=model) if model else CLITransport()
@@ -343,7 +373,7 @@ def _build_sdk_policy(
         clock=clock,  # type: ignore[arg-type]
     )
     governed = GovernedTransport(inner=transport, governor=governor)
-    policy = SDKPolicy(transport=governed)
+    policy = SDKPolicy(transport=governed, timeout_s=_SDK_TIMEOUT_S)
     goal = agent_notes if agent_notes else "Play the game shown in the frames."
     return policy, governor, goal
 
@@ -351,7 +381,8 @@ def _build_sdk_policy(
 def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
           pattern: str = "square", warmup: str | None = None, policy_kind: str = "scripted",
           provider: str = "anthropic", model: str | None = None,
-          budget_tpm: float = 60_000.0) -> int:
+          budget_tpm: float = 60_000.0, ollama_base_url: str | None = None,
+          ollama_keep_alive: str | None = None) -> int:
     """The whole loop, end to end: see the game, decide, act, and record all of it.
 
     Capture -> policy -> action chunk -> scheduler -> virtual pad -> game, with every frame,
@@ -415,6 +446,7 @@ def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
             sdk_policy, governor, goal = _build_sdk_policy(
                 provider, model, budget_tpm, clock,
                 profile.agent_notes if profile else None,
+                ollama_base_url, ollama_keep_alive,
             )
         except ImportError as error:
             print(f"could not build the '{provider}' policy: {error}")
@@ -464,6 +496,8 @@ def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
     print(f"\npolicy:   proposed={stats.chunks_proposed} accepted={stats.chunks_accepted} "
           f"rejected={stats.chunks_rejected} errors={stats.policy_errors} "
           f"budget_skips={stats.budget_skips}")
+    if stats.last_policy_error:
+        print(f"  last policy error: {stats.last_policy_error}")
     print(f"capture:  frames={capture_stats.frames_captured} "
           f"dropped={capture_stats.frames_dropped} errored={capture_stats.frames_errored}")
     print(f"events:   {stats.events_seen}")
@@ -720,8 +754,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--session", default=None, help="session directory for 'replay'")
     parser.add_argument("--frames", type=int, default=5, help="frames for the 'capture' command")
     parser.add_argument("--out", default="captures", help="output directory for 'capture'")
-    parser.add_argument("--recordings", default="recordings",
-                        help="session root directory for 'agent'")
+    # These six are also settable via PLAYER2_* environment variables or a .env file (see
+    # player2/config.py); default=SUPPRESS lets resolve_runtime_config() below distinguish
+    # "not passed on the CLI" from "passed with the same value as the hardcoded default" --
+    # the same absent-is-not-empty split contracts.py uses for pad state.
+    parser.add_argument("--recordings", default=argparse.SUPPRESS,
+                        help="session root directory for 'agent' (default 'recordings')")
     parser.add_argument("--pattern", choices=["square", "spiral"], default="square",
                         help="movement pattern for 'agent' when --policy scripted")
     parser.add_argument("--warmup", default=None,
@@ -730,13 +768,28 @@ def main(argv: list[str] | None = None) -> int:
                         help="'scripted' needs no credentials; 'sdk' runs a real governed "
                              "model policy for 'agent'")
     parser.add_argument("--provider", choices=["anthropic", "openai", "cli", "ollama"],
-                        default="anthropic", help="model transport for --policy sdk")
-    parser.add_argument("--model", default=None,
+                        default=argparse.SUPPRESS,
+                        help="model transport for --policy sdk (default 'anthropic')")
+    parser.add_argument("--model", default=argparse.SUPPRESS,
                         help="model override for --policy sdk (provider-specific default "
                              "otherwise)")
-    parser.add_argument("--budget-tpm", type=float, default=60_000.0,
+    parser.add_argument("--budget-tpm", type=float, default=argparse.SUPPRESS,
                         help="tokens-per-minute cap for --policy sdk before it degrades "
-                             "cadence, then stops proposing")
+                             "cadence, then stops proposing (default 60000)")
+    parser.add_argument("--ollama-base-url", default=argparse.SUPPRESS,
+                        help="OpenAI-compatible base URL for --provider ollama, e.g. "
+                             "http://192.168.1.5:11434/v1 to reach Ollama on another machine "
+                             "(default: OllamaTransport's own localhost default)")
+    parser.add_argument("--ollama-keep-alive", default=argparse.SUPPRESS,
+                        help="how long --provider ollama keeps the model loaded after use, "
+                             "e.g. '30m' or '-1' for indefinitely (default: Ollama's own 5m). "
+                             "Sent via a native-API warm-up call before the loop starts, since "
+                             "Ollama's OpenAI-compatible endpoint ignores this field entirely")
+    parser.add_argument("--env-file", default=".env",
+                        help="dotenv file to read PLAYER2_* values from (default '.env' in "
+                             "the current directory; silently skipped if absent)")
+    parser.add_argument("--no-env-file", action="store_true",
+                        help="don't read --env-file even if it exists")
     parser.add_argument("--direction", choices=sorted(DIRECTIONS), default="right",
                         help="direction for the 'hold' command")
     parser.add_argument("--seconds", type=float, default=1.0, help="seconds per side")
@@ -744,7 +797,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="use the null adapter; creates no virtual device")
     parser.add_argument("--delay", type=float, default=5.0,
                         help="seconds to wait before moving, so you can focus the game")
-    parser.add_argument("--profile", default=None,
+    parser.add_argument("--profile", default=argparse.SUPPRESS,
                         help="path to a game profile TOML under profiles/")
     parser.add_argument("--name", default=None, help="macro name, for the 'macro' command")
     parser.add_argument("--wrap", action="store_true",
@@ -756,26 +809,43 @@ def main(argv: list[str] | None = None) -> int:
         return probe()
     if args.command == "readback":
         return readback()
-    if args.command == "capture":
-        return capture(args.profile, args.frames, args.out, delay)
-    if args.command == "agent":
-        return agent(args.profile, args.seconds, delay, args.recordings, args.pattern,
-                     args.warmup, args.policy, args.provider, args.model, args.budget_tpm)
     if args.command == "replay":
         if not args.session:
             parser.error("replay requires --session")
         return replay(args.session)
+
+    # Only commands that reach here consult config.* -- probe/readback/replay must not fail
+    # over an unrelated broken .env or PLAYER2_* value, and every failure mode here (a bad
+    # --env-file path, malformed dotenv syntax, an invalid provider or budget_tpm) should read
+    # like the rest of this parser's own errors, not an unhandled traceback.
+    try:
+        dotenv = {} if args.no_env_file else load_dotenv_file(Path(args.env_file))
+        cli_config = {
+            key: value for key, value in vars(args).items()
+            if key in ("provider", "model", "budget_tpm", "ollama_base_url",
+                       "ollama_keep_alive", "recordings", "profile")
+        }
+        config = resolve_runtime_config(cli=cli_config, environ=dict(os.environ), dotenv=dotenv)
+    except (ValueError, OSError) as error:
+        parser.error(f"invalid configuration: {error}")
+
+    if args.command == "capture":
+        return capture(config.profile, args.frames, args.out, delay)
+    if args.command == "agent":
+        return agent(config.profile, args.seconds, delay, config.recordings, args.pattern,
+                     args.warmup, args.policy, config.provider, config.model,
+                     config.budget_tpm, config.ollama_base_url, config.ollama_keep_alive)
     if args.command == "session":
-        return session(args.profile)
+        return session(config.profile)
     if args.command == "hold":
         return hold(args.direction, args.seconds, args.dry_run, delay)
     if args.command == "macro":
-        if not args.profile or not args.name:
+        if not config.profile or not args.name:
             parser.error("macro requires --profile and --name")
-        return macro(args.profile, args.name, args.dry_run, delay)
+        return macro(config.profile, args.name, args.dry_run, delay)
 
-    wrap = _wrap_chunk(args.profile) if args.wrap else None
-    if args.wrap and wrap is None and not args.profile:
+    wrap = _wrap_chunk(config.profile) if args.wrap else None
+    if args.wrap and wrap is None and not config.profile:
         parser.error("--wrap requires --profile")
     if args.command == "square":
         return square(args.seconds, args.dry_run, delay, wrap)

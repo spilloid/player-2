@@ -177,6 +177,234 @@ supporting._
 
 | 8 | Budget governor (`budget.py`: rolling token-rate window, degrade ladder, `GovernedTransport`) + `AgentLoop` cadence integration + 4th transport (`OllamaTransport`, OpenAI-compat) + `last_usage` telemetry on all 4 transports — 7 files | **Terra/high** | **Sol/high** | 11 + 1 Claude (self-caught before review) | 11 real, 6 fixed with new tests, 5 accepted-and-documented as scoped limitations | 0 | 57,167 (Terra) + 19,505 (Sol/high review) | See notes below. Cheapest full-unit implementation to date at this scope (7 files) — a well-decomposed, test-first spec let Terra/high do it directly with no Sol/ultra escalation. |
 
+| 9 | Remote-host config layer: `player2/config.py` (CLI > env var > `.env` > default precedence) + `demo.py` CLI wiring for a LAN Ollama endpoint (`--ollama-base-url`, `--env-file`/`--no-env-file`) | Terra/medium (`config.py`) + **Claude** (`demo.py` wiring, inverted routing) | Terra/high (design consult + both diffs) + Claude (`config.py` review) | 1 (`demo.py` review) | 1, confirmed by direct reproduction | 0 — `demo.py` has no test file by standing project convention | 7,013 (design) + 28,655 (`config.py` impl) + 34,198 (`demo.py` review) = 69,866 | See notes below. First unit mixing a Codex-authored file with a Claude-authored file in the same unit, both reviewed by Codex. |
+| 10 | Fix: `AgentLoop._decide()` silently discarded policy-error exception detail (`player2/agent/loop.py`) | **Claude** (inverted routing — `loop.py` has a real suite) | Terra/high | 2 | 1 real, confirmed by direct reproduction; 1 rejected (hypothetical positional-construction compatibility, no such caller exists) | 0 | 49,879 (review) | See notes below. The fix's first draft introduced a worse bug than the one it fixed — an unprotected `str(error)` call turned a poisoned exception's broken `__str__` into full worker-thread death, caught only because the diff was reviewed instead of trusted on a passing test. |
+| 11 | Ollama `keep_alive`: `OllamaTransport.warm()` (native-API pre-load, `player2/agent/ollama_transport.py`) + `ollama_keep_alive` config field + `demo.py` wiring (`--ollama-keep-alive`) | Terra/medium (`warm()`) + Luna/low (`config.py` field) + **Claude** (`demo.py` wiring) | Terra/high | 4 | 2 real, both confirmed by direct reproduction; 2 accepted as documented limitations (not fixed) | 0 | (not separately logged this call) | See notes below. Both real findings were confirmed BEFORE trusting the reviewer's writeup, by re-running the exact failure live — same discipline the design phase used to disprove an assumption about the OpenAI-compat endpoint in the first place. |
+
+### Unit 9 detail — a second machine, and a defect only the untested half produced
+
+Joey: move Ollama inference off the CPU-only Surface Laptop onto a second LAN machine (a Linux
+box, RX 6600, 8GB VRAM, ROCm with `HSA_OVERRIDE`-style overrides) while Factorio itself stays on
+Windows — "let's plan and talk" first, then build it. `OllamaTransport` already accepted an
+injectable `base_url` (Unit 8), so the runtime needed zero architectural change; the actual gap
+was CLI/config plumbing only, which is the outcome a correctly-designed seam should produce.
+
+**Model prep, over HTTP, no SSH:** deleted the box's existing `qwen3:4b` (text-only, no vision —
+useless for `propose()`) via Ollama's `DELETE /api/delete`, then pulled
+`hf.co/Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M` (Unit 8's confirmed vision+tools model) via
+`POST /api/pull`, pinning the quant explicitly given the 8GB card.
+
+**A capability label that lied, caught before it was trusted:** the freshly-pulled model's
+`/api/tags` entry reported capabilities `["completion", "vision"]` — no `"tools"` — despite being
+the exact model Unit 8 confirmed does forced tool-calling. Rather than trust the label, ran the
+real production path against it directly (a real `Frame`, `action_chunk_tool_schema()`,
+`OllamaTransport.complete_tool()`, no simplified stand-in): succeeded in **9.6s**, a valid
+`ActionChunk` back through the real schema, first attempt. Conclusion: Ollama's capability
+metadata for HF-pulled GGUFs cannot be trusted over an actual live call — this project's own
+"live-verify before trusting a transport" rule (Units 7–8) caught a second, differently-shaped
+version of the same risk. Also notable: 9.6s beats Unit 8's 25.4s CPU-only baseline by a wide
+margin, despite the RX 6600 being a modest card running ROCm overrides — real GPU inference, even
+constrained, comfortably beats a modern CPU here.
+
+**Design consult before any test was written**, at Joey's explicit request: Terra/high on
+precedence chain, module shape, hand-rolled parser vs. `python-dotenv`, naming (`PLAYER2_*`,
+deliberately *not* aliasing Ollama's own bare `OLLAMA_HOST` — that variable configures the Ollama
+server/CLI's own target, a different meaning that would silently double up), `.env` lookup
+location, testability without touching real `os.environ`, and the absent-vs-empty question this
+project has hit before (`contracts.py`'s `buttons=None` vs `buttons=frozenset()`). Settled in one
+call, 7,013 tok.
+
+Claude wrote 20 tests (`tests/test_config.py`) as the spec, reusing that same absent-is-not-empty
+invariant for CLI-mapping key presence rather than inventing a second convention. Terra/medium
+implemented `player2/config.py` against them in one pass — 20/20 passing, ruff and mypy clean,
+28,655 tok. The only wrinkle: this machine's `.pytest-tmp` was permission-locked from an earlier
+elevated run (the exact failure mode `pyproject.toml`'s own comment warns about); Terra correctly
+read that as environment noise, not a spec defect, and verified against an isolated basetemp
+instead of touching the test file. Claude reviewed the diff directly (no findings) and
+independently re-ran the full suite after clearing the stale directory — 579 passed, 1 skipped,
+ruff and mypy `--strict` clean.
+
+`demo.py`'s CLI wiring is untested glue by this project's own standing convention — `main()` has
+never had a test file, being argparse plumbing over already-tested internals. Rather than force a
+spec onto that shape, **Claude authored the wiring directly** (an inversion of the usual routing,
+per the standing instruction to periodically implement and let Codex evaluate) and sent the diff
+to Terra/high for adversarial review, 34,198 tok.
+
+**Terra found one real defect, confirmed by direct reproduction, not trusted from the writeup:**
+config resolution (`.env` load + `resolve_runtime_config`) ran unconditionally before command
+dispatch, so a malformed `.env` or an invalid `PLAYER2_PROVIDER`/`PLAYER2_BUDGET_TPM` broke
+*every* command — including `probe`, `readback`, and `replay`, none of which touch config — with
+a raw traceback instead of this file's normal `parser.error()` style. Reproduced directly:
+`python -m player2.demo probe --env-file <malformed>` raised an uncaught `ValueError` to the
+terminal. Fixed by dispatching `probe`/`readback`/`replay` before config resolution runs at all,
+and wrapping the remaining resolution in `try`/`except (ValueError, OSError)` →
+`parser.error(...)`. Re-reproduced clean after the fix: `probe` now survives the same malformed
+file untouched; `agent` now fails with `demo.py: error: invalid configuration: ...` instead of a
+traceback.
+
+Final: 579 tests passing, ruff and mypy `--strict` clean, plus the live remote smoke test above
+run outside the suite. `.env` added to `.gitignore`; `.env.example` committed as the documented
+template.
+
+#### Live verification, 2026-08-14 — the remote box actually played the game
+
+Joey opened Factorio, loaded the `newbie` save, left it paused, and asked to hook it up. Ran
+`agent --policy sdk --provider ollama --ollama-base-url http://192.168.68.3:11434/v1 --model
+hf.co/Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M --profile profiles/factorio.toml --warmup
+toggle_pause --seconds 90` — the first time the remote-host config landed in this unit was
+actually exercised end to end, not just smoke-tested against a synthetic frame.
+
+Result: window resolved (`'Factorio: Space Age 2.0.7'`), `toggle_pause` warmup unpaused the game
+inside the same pad session, 10 chunks proposed, **10 accepted, 0 rejected**, 2 policy errors,
+budget stayed at `normal` (15,185 of 60,000 tok/min). Replay's sampled-frame view showed an
+all-neutral pad at first glance — misleading until checked against the raw pad log: 465 of 5,983
+recorded pad samples were non-neutral, including a real interpolated stick movement at t=42.7s
+(`left_stick` ramping smoothly from ~0.50 toward neutral, not noise) and `A`/`Y`/`START` presses.
+The neutral-looking sampled frames were `deadman` correctly zeroing the pad between decisions
+that took longer than their own chunk's duration to arrive — the safety property working exactly
+as designed, not a defect, and a reminder that `replay`'s 8-frame preview is not sufficient
+evidence on its own for "did anything happen" on a run this sparse; the raw pad log is the source
+of truth.
+
+**Resolved same session, once Joey asked to circle back:** 2 of 12 decision attempts errored
+rather than producing an accepted chunk. Root cause found by code inspection, not a captured
+traceback — `_decide()`'s swallow (see Unit 10 below) meant there was nothing to inspect from the
+run itself. `SDKPolicy` defaults `timeout_s` to 10s (`model_policy.py`), sized for a fast cloud
+API; `_build_sdk_policy()` never overrode it. Against this project's own measured latency —
+9.6s baseline on this same remote box minutes earlier, 25.4–65.1s on the CPU-only laptop in Unit
+8, one attempt over 180s — a 10s cutoff was always going to clip some fraction of real decisions.
+Fixed: `_SDK_TIMEOUT_S = 90.0` in `demo.py`, clearing every successful measurement on record
+without chasing the one outlier. (First pass at the justifying comment named the game directly in
+`demo.py` — caught immediately by `TestRuntimeStaysGameAgnostic`, reworded before it shipped.)
+
+**Zoom controls, added same session** (Joey: view felt too tight). Read `zoom-in-controller`/
+`zoom-out-controller` straight from `config.ini` (right-trigger + D-pad up/down, same source
+discipline as every other binding in this profile) rather than guessing, added `zoom_in`/
+`zoom_out` macros mirroring `toggle_pause`'s RT-before-chord timing, and a line in `agent_notes`
+so the live model itself knows zoom exists. Verified with the recorder rather than trusting the
+result blind, per Joey's explicit ask: captured a frame before, ran `zoom_out`, captured a frame
+after — genuinely wider field of view (two more power poles, radar panel, two buildings entered
+frame). Along the way, hit `PLATFORM-NOTES.md` §1 face-first: the Game menu kept reappearing
+after every fix attempt because each attempt was its own one-shot `session`/`capture` invocation,
+and disconnecting the pad on exit re-triggers Factorio's console-style pause-on-disconnect,
+independent of anything the macros did. First guess at closing the menu (`menu_back`, the B
+button) did not work; second attempt read Factorio's own UI rather than guessing again — a
+"Confirm (Y)" tooltip was visible over the highlighted "Resume" button in the captured frame,
+so `menu_confirm` (Y) was tried instead. Also did not close the menu in the following capture,
+consistent with §1: the pad disconnects at the end of every one-shot command regardless of what
+was pressed, so the menu reappearing was not evidence the fix failed. Not fully closed out this
+session — correct per §1's own rule ("the agent's hands must outlive any single decision") is to
+never disconnect between the fix and the check, which the next real `agent` run's warmup already
+does automatically.
+
+### Unit 10 detail — a fix for a silent swallow that briefly introduced a worse one
+
+Direct follow-up to Unit 9's open item, at Joey's request to "circle onto the errors." Diagnosing
+the timeout (above) surfaced a second, independent problem: `AgentLoop._decide()`
+(`player2/agent/loop.py`) caught any exception from `self._policy.propose(observation)`,
+incremented `policy_errors`, and discarded the exception itself — by original design, so a
+malformed model response could never kill cognition, but with the side effect that a live
+session reporting "2 policy errors" carried zero information about what they actually were.
+
+Claude wrote the test first (`tests/test_agent.py`): a policy that always raises
+`RuntimeError("distinctive failure detail")`, asserting the new field carries that string AND
+that the pre-existing `last_error` field (worker-thread death) stays `None` — proving the two
+stay genuinely independent, not just that the new one exists. Implemented directly (untested-glue
+routing didn't apply here; `loop.py` has a real suite) — a new `AgentStats.last_policy_error`
+field, a `_record_policy_error()` method mirroring the existing `_set_last_error()`, deliberately
+NOT reusing `last_error` since conflating "one flaky decision" with "the worker thread died"
+would make `last_error` unreliable as a liveness signal. Surfaced in `demo.py`'s printed summary.
+
+**Sent for Terra/high review** (an inversion of the usual routing — Claude as author, Codex as
+reviewer, per the standing instruction to periodically swap roles) rather than assumed correct
+because a test passed. **Found 1 real defect, confirmed by direct reproduction**, not trusted
+from the writeup: `_record_policy_error`'s `str(error)` call was unprotected. An exception whose
+own `__str__` raises (a real, not hypothetical, shape for a transport error wrapping a
+provider-SDK object) would escape `_decide()`'s handler entirely, reach `_run()`'s outer
+`except BaseException`, and kill the whole worker thread — turning the exact failure this fix
+exists to make survivable into something *more* fatal than the code it replaced. Reproduced
+directly: a policy raising an exception with a poisoned `__str__` left `policy_errors` at 0 and
+set `last_error` instead of `last_policy_error` — full cognition death, confirmed via `is_running`
+before any fix. Fixed with a shared `_describe()` helper (try `str()`, fall back to
+`type(error).__name__` on failure) applied to both `_record_policy_error` and `_set_last_error`,
+closing the same latent bug in the pre-existing method too. Regression test added, reproduction
+re-run clean after the fix (`policy_errors: 9`, `last_policy_error: 'BrokenStr'`, `last_error:
+None`). Codex's second finding — `AgentStats.last_policy_error` breaking hypothetical positional
+construction by external callers — rejected: no such caller exists anywhere in this codebase and
+the dataclass is not a documented public API boundary.
+
+Final: 581 tests passing, ruff and mypy `--strict` clean.
+
+### Unit 11 detail — the same "verify before trusting" discipline, twice in one unit
+
+Joey: "let's implement Keep Alive and make sure we're using Ollama in a way that's time
+efficient" — the 30s+ cold-load tax measured live in Unit 9 (and again this unit) is real money
+against a session, not a hypothetical.
+
+**Design assumption disproved before any code was written.** The obvious approach — pass
+`keep_alive` in the OpenAI-compatible request body, since `OllamaTransport` already goes through
+that endpoint for everything — was tested live against the real box first rather than assumed.
+Result: Ollama's `/v1/chat/completions` silently ignores it; `/api/ps`'s `expires_at` stayed on
+the default 5-minute window regardless of what was sent. Only the native `/api/generate` endpoint
+honors `keep_alive`, confirmed by the same live check (expiry landed within a couple seconds of
+the requested duration). A third live check closed the design: a normal OpenAI-compat inference
+call afterward *extends* an already-set expiry rather than resetting it to 5 minutes — so one
+warm-up ping before a session starts is sufficient; every real decision naturally re-extends the
+same window. This is why `warm()` exists as a distinct method hitting a different endpoint
+entirely, rather than a parameter threaded through the inherited `complete_tool`/`complete_text`.
+
+Claude wrote tests for both new pieces. `OllamaTransport.warm()`/`keep_alive` (`player2/agent/
+ollama_transport.py`) went to Terra/medium — a pure payload-building function plus an injectable
+native-API pinger, mirroring the project's existing DI pattern for the OpenAI-compat client.
+`ollama_keep_alive` in `player2/config.py` — identical in shape to the already-reviewed
+`ollama_base_url` field — went to **Luna/low**, a deliberate test of the standing question about
+routing genuinely mechanical, already-established-pattern work to the cheapest tier: clean diff,
+exact match to spec, only the same pre-existing `.pytest-tmp` permission quirk (correctly not
+touched). `demo.py`'s CLI wiring (`--ollama-keep-alive`, calling `.warm()` in `_build_sdk_policy()`
+before the loop starts) was Claude-authored directly, same untested-glue convention as Units 9-10.
+
+**Live-verified end to end through the real CLI**, not just the isolated class: `--ollama-keep-alive
+15m` against the real box, confirmed via `/api/ps` that `expires_at` landed at 14m58s out —
+correct to the second, and specifically through `main()` → `agent()` → `_build_sdk_policy()` →
+`OllamaTransport.warm()`, not a shortcut around any of that plumbing.
+
+**Terra/high review, 4 findings, 2 real, both confirmed by reproduction before being trusted —
+same discipline as the design phase's live checks, now aimed at the diff instead of an
+assumption:**
+
+1. **High, confirmed:** `warm()`'s network call could raise `URLError`/`HTTPError`/`TimeoutError`
+   (all subclasses of `OSError`, confirmed by checking Python's own exception hierarchy rather
+   than assuming), and `agent()`'s only catch around `_build_sdk_policy()` was `except
+   ImportError` — an unrelated exception type. Reproduced directly: pointing `_build_sdk_policy()`
+   at an unreachable port raised `urllib.error.URLError` straight out, uncaught, which would have
+   skipped `recorder.stop()`/`video.stop()` entirely (no `finally` wraps that section of
+   `agent()`). Fixed: `warm()`'s failure is now caught at the call site (`OSError`, printed as a
+   warning, session continues without the pre-warm benefit) — an optimization failing must not
+   make the whole session fail, but it also must not vanish silently, the same principle Unit 10
+   just established for policy errors, now applied to a different failure mode in the same file.
+2. **Medium, confirmed:** the native URL was derived by chaining `.removesuffix("/v1")` then
+   `.removesuffix("/")` — correct for `.../v1`, wrong for `.../v1/` (an entirely ordinary shape to
+   type or paste; this project's own remote box's URL took that exact form the first time it was
+   entered tonight). The trailing slash survives unstripped, producing `.../v1/api/generate`
+   instead of `.../api/generate`. Reproduced directly against the literal function. Fixed by
+   replacing suffix-stripping with `urllib.parse.urlsplit`/`urlunsplit`, discarding the path
+   entirely rather than guessing which suffix to strip — correct by construction for any path
+   shape, not just the one case that happened to get tested. Regression test added.
+3. **Low, accepted as a documented limitation, not fixed:** a sub-second `keep_alive` could
+   plausibly expire before the first real decision arrives, since `warm()` runs before policy
+   construction, scheduler startup, window focus, and the first captured frame. Not fixed: nobody
+   would configure a sub-second keep_alive in practice, and defending against a value that
+   nonsensical is scope this project's own conventions argue against.
+4. **Low, accepted:** flagged test-coverage gaps beyond the trailing-slash case (now closed) and
+   `demo.py`'s CLI-level paths. The latter stay unaddressed by unit test, consistent with this
+   project's standing convention that `demo.py` has no test file — but both paths flagged (the
+   success path and the warm-failure path) were live-reproduced directly against the real
+   `_build_sdk_policy()` and the real remote box, immediately above and in this section.
+
+Final: 589 tests passing, ruff and mypy `--strict` clean, both fixes re-verified live against the
+real box after the fix (correct URL for a trailing-slash base_url; graceful continuation with a
+printed warning for an unreachable one).
+
 ### Unit 8 detail — a Critical finding that was invisible to my own test spec by construction
 
 Direct successor to Unit 7 by explicit user instruction, given before any live test of the SDK

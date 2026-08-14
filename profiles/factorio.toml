@@ -6,6 +6,8 @@
 #
 # Bindings below were read from Factorio's own config.ini rather than guessed:
 #   pause-game-controller = controller-righttrigger + controller-start
+#   zoom-in-controller    = controller-righttrigger + controller-dpup
+#   zoom-out-controller   = controller-righttrigger + controller-dpdown
 #
 # Requires `input-method=game-controller` in %APPDATA%\Factorio\config\config.ini.
 # Factorio detects the virtual pad either way (it logs "Game controller connected"),
@@ -34,6 +36,8 @@ Controller bindings (Factorio's defaults, read from config.ini, not guessed):
   open the inventory / character / crafting screen: Y. rotate a held item: D-pad right,
   reverse: D-pad left. pick up the item under the cursor: D-pad down. cancel a held item
   or pipette a recipe from an entity: B. confirm a GUI prompt: Y.
+  zoom in: right trigger + D-pad up. zoom out: right trigger + D-pad down. Use these to
+  see more of the factory when the view feels too close to plan placement or pathing.
   Pausing and closing a menu are handled by this profile's own macros, not raw buttons.
 
 Suggested objective, absent any goal a session sets explicitly: prioritize automating
@@ -52,6 +56,28 @@ keyframes = [
   { t_ms = 40,  buttons = [], right_trigger = 1.0 },
   { t_ms = 80,  buttons = ["START"], right_trigger = 1.0 },
   { t_ms = 180, buttons = ["START"], right_trigger = 1.0 },
+  { t_ms = 220, buttons = [], right_trigger = 0.0 },
+]
+
+# Same RT-before-chord shape as toggle_pause, same reason. One press = one zoom step; replay
+# again for another step. From config.ini: zoom-in-controller = controller-righttrigger +
+# controller-dpup.
+[macros.zoom_in]
+keyframes = [
+  { t_ms = 0,   buttons = [], right_trigger = 0.0 },
+  { t_ms = 40,  buttons = [], right_trigger = 1.0 },
+  { t_ms = 80,  buttons = ["DPAD_UP"], right_trigger = 1.0 },
+  { t_ms = 180, buttons = ["DPAD_UP"], right_trigger = 1.0 },
+  { t_ms = 220, buttons = [], right_trigger = 0.0 },
+]
+
+# From config.ini: zoom-out-controller = controller-righttrigger + controller-dpdown.
+[macros.zoom_out]
+keyframes = [
+  { t_ms = 0,   buttons = [], right_trigger = 0.0 },
+  { t_ms = 40,  buttons = [], right_trigger = 1.0 },
+  { t_ms = 80,  buttons = ["DPAD_DOWN"], right_trigger = 1.0 },
+  { t_ms = 180, buttons = ["DPAD_DOWN"], right_trigger = 1.0 },
   { t_ms = 220, buttons = [], right_trigger = 0.0 },
 ]
 

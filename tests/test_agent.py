@@ -273,6 +273,60 @@ class TestLoopIsolatesCognitionFromTheHands:
         assert policy.calls >= 2, "the loop died on the first policy failure"
         assert loop.stats.policy_errors >= 1
 
+    def test_a_policy_error_detail_is_not_silently_discarded(self) -> None:
+        """`_decide()` used to catch the policy's exception, count it, and throw the exception
+        itself away -- a policy_errors=2 in the final stats line carried no information about
+        what actually failed. This is distinct from `last_error` (worker-thread death); a single
+        flaky decision must not be mistaken for the whole loop dying, so it gets its own field."""
+        class AlwaysRaises:
+            def propose(self, observation: Observation) -> ActionChunk | None:
+                raise RuntimeError("distinctive failure detail")
+
+        loop, _, video, _ = build(AlwaysRaises())
+        video.emit(1)
+        loop.start()
+        try:
+            deadline = time.time() + 3.0
+            while time.time() < deadline and loop.stats.policy_errors < 1:
+                time.sleep(0.01)
+        finally:
+            loop.stop()
+        stats = loop.stats
+        assert stats.policy_errors >= 1
+        assert stats.last_policy_error is not None
+        assert "distinctive failure detail" in stats.last_policy_error
+        assert stats.last_error is None, "a routine policy error must not read as worker death"
+
+    def test_a_policy_error_with_a_broken_str_does_not_kill_the_loop(self) -> None:
+        """Formatting the caught exception (`str(error)`) must not itself be able to raise --
+        that would let ONE malformed exception escape `_decide()`'s own handler, reach `_run()`'s
+        fatal handler, and kill cognition entirely. Exactly the failure mode this fix exists to
+        prevent, just reached through the detail-capturing code instead of around it."""
+        class BrokenStr(RuntimeError):
+            def __str__(self) -> str:
+                raise ValueError("broken __str__")
+
+        class PoisonPolicy:
+            def propose(self, observation: Observation) -> ActionChunk | None:
+                raise BrokenStr("irrelevant")
+
+        loop, _, video, _ = build(PoisonPolicy())
+        video.emit(1)
+        loop.start()
+        try:
+            deadline = time.time() + 3.0
+            while time.time() < deadline and loop.stats.policy_errors < 1:
+                time.sleep(0.01)
+        finally:
+            loop.stop()
+        stats = loop.stats
+        assert stats.policy_errors >= 1, (
+            "the polling loop timed out, meaning the worker thread died from the broken __str__ "
+            "before it could record even one policy error"
+        )
+        assert stats.last_policy_error is not None
+        assert stats.last_error is None, "a poisoned policy exception must not read as worker death"
+
     def test_an_invalid_chunk_is_rejected_without_stopping_the_loop(self) -> None:
         loop, scheduler, video, _ = build(ScriptedPolicy([ActionChunk(keyframes=())]))
         video.emit(1)
