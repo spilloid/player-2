@@ -31,6 +31,7 @@ import math
 import os
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -323,6 +324,7 @@ def _build_sdk_policy(
     provider: str, model: str | None, budget_tpm: float, clock: object, agent_notes: str | None,
     ollama_base_url: str | None = None, ollama_keep_alive: str | None = None,
     goal_override: str | None = None, history_window: int | None = None,
+    commentary_required: bool = False,
 ) -> tuple[object, object, str | None]:
     """Build a governed SDKPolicy for the requested provider.
 
@@ -385,7 +387,8 @@ def _build_sdk_policy(
     # error 0 deserves -- exactly the absent-vs-empty defect class this project has hit before.
     if history_window is not None:
         sdk_kwargs["history_window"] = history_window
-    policy = SDKPolicy(transport=governed, timeout_s=_SDK_TIMEOUT_S, **sdk_kwargs)
+    policy = SDKPolicy(transport=governed, timeout_s=_SDK_TIMEOUT_S,
+                       require_commentary=commentary_required, **sdk_kwargs)
     goal = agent_notes if agent_notes else "Play the game shown in the frames."
     if goal_override:
         # Additive, never a replacement: agent_notes carries the controller bindings the
@@ -414,9 +417,12 @@ def _format_channel(value: object) -> str:
 def _format_decision(event: DecisionEvent) -> str:
     """Render one DecisionEvent as a single readable line for --verbose live output.
 
-    Shows only the opening state of the first keyframe plus total duration -- a deliberate
-    summary for a terse one-line-per-decision view, not the full multi-keyframe chunk (which
-    the callback's caller still has, via event.chunk, if a fuller view is ever wanted).
+    When the model filled in `commentary` (see model_schema.action_chunk_tool_schema), that
+    -- not raw controller state -- is the whole line: it is what answers "what is the model
+    doing and why" for a human watching a session happen, which stick vectors and button sets
+    do not. Falls back to the previous controller-state summary when commentary is absent
+    (scripted policies, or a model that skipped the optional field), so --verbose never goes
+    silent about an accepted decision.
     """
     from player2.agent.loop import DecisionOutcome
 
@@ -424,6 +430,8 @@ def _format_decision(event: DecisionEvent) -> str:
     label = (f"[decision {event.decision_seq:>4}] "
              f"{event.elapsed_ms / 1000.0:6.1f}s  {outcome.value.upper():<9}")
     if outcome == DecisionOutcome.ACCEPTED and event.chunk is not None:
+        if event.chunk.commentary:
+            return f'{label} "{event.chunk.commentary}"'
         first = event.chunk.keyframes[0]
         duration = event.chunk.keyframes[-1].t_ms
         return (f"{label} left_stick={_format_channel(first.left_stick)} "
@@ -439,12 +447,65 @@ def _format_decision(event: DecisionEvent) -> str:
     return label
 
 
+def _overlay_text(event: DecisionEvent) -> str:
+    """Render one DecisionEvent as the short text a --overlay window shows.
+
+    Unlike _format_decision's terminal line, there is no room here for controller state or
+    timing -- the overlay exists purely to answer "what does the model say it's doing right
+    now," so a missing commentary is reported explicitly (not silently swapped for a
+    stick/button dump) precisely because that absence, confirmed live against a real local
+    model (docs/DEV-PROCESS.md, Unit 14), is itself something worth seeing rather than hiding.
+    """
+    from player2.agent.loop import DecisionOutcome
+
+    outcome = event.outcome
+    if outcome == DecisionOutcome.ACCEPTED and event.chunk is not None:
+        if event.chunk.commentary:
+            return event.chunk.commentary
+        return f"decision {event.decision_seq}: (model gave no commentary this time)"
+    if outcome == DecisionOutcome.ERROR and event.detail:
+        return f"decision {event.decision_seq}: error -- {event.detail}"
+    if outcome == DecisionOutcome.NONE:
+        return f"decision {event.decision_seq}: (model proposed nothing this cycle)"
+    if outcome == DecisionOutcome.REJECTED:
+        return f"decision {event.decision_seq}: (scheduler declined the proposal)"
+    if outcome == DecisionOutcome.CANCELLED:
+        return f"decision {event.decision_seq}: (session stopped before this landed)"
+    return f"decision {event.decision_seq}: {outcome.value}"
+
+
+def _combine_on_decision(
+    callbacks: list[Callable[[DecisionEvent], None]],
+) -> Callable[[DecisionEvent], None] | None:
+    """Fan one DecisionEvent out to several best-effort observers (e.g. --verbose print AND
+    --overlay update running at once), each isolated from the others' exceptions -- the same
+    discipline AgentLoop._report_decision already applies to a single callback, extended here
+    so a bug in one observer cannot silence a sibling one. Returns None when there is nothing
+    to call, so a caller can pass the result straight through to AgentLoop's on_decision
+    without a separate "is this a no-op" check of its own.
+    """
+    if not callbacks:
+        return None
+    if len(callbacks) == 1:
+        return callbacks[0]
+
+    def _dispatch(event: DecisionEvent) -> None:
+        for callback in callbacks:
+            try:
+                callback(event)
+            except Exception:
+                pass
+
+    return _dispatch
+
+
 def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
           pattern: str = "square", warmup: str | None = None, policy_kind: str = "scripted",
           provider: str = "anthropic", model: str | None = None,
           budget_tpm: float = 60_000.0, ollama_base_url: str | None = None,
           ollama_keep_alive: str | None = None, verbose: bool = False,
-          goal_override: str | None = None, history_window: int | None = None) -> int:
+          goal_override: str | None = None, history_window: int | None = None,
+          commentary_required: bool = False, overlay: bool = False) -> int:
     """The whole loop, end to end: see the game, decide, act, and record all of it.
 
     Capture -> policy -> action chunk -> scheduler -> virtual pad -> game, with every frame,
@@ -453,6 +514,10 @@ def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
     no credentials; `policy_kind="sdk"` runs a real model behind the same seam, governed by a
     token-rate budget so it degrades cadence rather than running unbounded. Nothing else in
     this function's path differs between the two -- that is the point of the seam.
+
+    `commentary_required` (--policy sdk only) and `overlay` change nothing about what the
+    runtime does to the controller; both are purely about watching a session live (see
+    docs/DEV-PROCESS.md, Unit 14's live-verification note and its followup).
     """
     from player2.agent.fast_stub import ScriptedPolicy
     from player2.agent.loop import AgentLoop
@@ -501,7 +566,32 @@ def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
     # 10-minute backgrounded run produced 45 real decisions with zero visible output until this
     # fix, even though the recorder (a separate, unbuffered file-write path) showed real-time
     # progress the whole time.
-    on_decision = (lambda event: print(_format_decision(event), flush=True)) if verbose else None
+    decision_callbacks: list[Callable[[DecisionEvent], None]] = []
+    if verbose:
+        decision_callbacks.append(lambda event: print(_format_decision(event), flush=True))
+
+    live_overlay = None
+    if overlay:
+        try:
+            from player2.overlay import LiveOverlay
+            live_overlay = LiveOverlay()
+            # Started here, well before focus_window() below, so that call -- not window
+            # creation -- is what ends up owning actual OS input focus; a topmost Tkinter
+            # window can otherwise grab focus for itself on creation.
+            live_overlay.start()
+        except Exception as error:  # noqa: BLE001 - the overlay is a convenience, not the session
+            # Covers both a missing Tkinter (rare on Windows but not guaranteed -- some
+            # minimal Python builds omit it; surfaces as ImportError) and a Tk/display
+            # failure once import succeeds (surfaces as tkinter.TclError) -- this mirrors
+            # capture()'s own cv2-optional handling either way: a failed optional dependency
+            # degrades the session, it does not end it.
+            print(f"could not start --overlay: {error} -- continuing without it")
+            live_overlay = None
+        else:
+            decision_callbacks.append(lambda event: live_overlay.update(_overlay_text(event)))
+            print("live overlay window open (top-right) -- click its ×, or wait, to end early")
+
+    on_decision = _combine_on_decision(decision_callbacks)
 
     # RecordingOutput wraps the real pad, so what gets recorded is what the device was
     # actually told to do -- not what the policy asked for. Those differ constantly.
@@ -519,6 +609,7 @@ def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
                 provider, model, budget_tpm, clock,
                 profile.agent_notes if profile else None,
                 ollama_base_url, ollama_keep_alive, goal_override, history_window,
+                commentary_required,
             )
         except (ImportError, ValueError) as error:
             # ValueError alongside ImportError: config.py's own coercion only validates that
@@ -556,21 +647,47 @@ def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
     sched_thread.start()
     try:
         focus_window(target.hwnd)
-        # Run any warm-up macro INSIDE this pad connection, before the loop starts. Doing it
-        # as a separate one-shot command creates and destroys a controller, and a game that
-        # pauses on controller disconnect will simply undo whatever the macro achieved.
+        # Run any warm-up macro(s) INSIDE this pad connection, before the loop starts. Doing
+        # this as a separate one-shot command per macro creates and destroys a controller
+        # each time, and a game that pauses on controller disconnect will simply undo
+        # whatever the macro achieved -- exactly the controller-lifetime bug this project
+        # already hit once (see CLAUDE.md). Comma-separated so a single connection can run
+        # several in sequence (e.g. dismiss a tutorial prompt, then unpause).
         if warmup and profile is not None:
-            time.sleep(0.4)
-            if scheduler.submit(replace(profile.get_macro(warmup), decision_seq=1)):
-                print(f"warm-up macro '{warmup}' submitted")
-                time.sleep(profile.get_macro(warmup).duration_ms / 1000.0 + 0.5)
+            # decision_seq must strictly increase per chunk or the scheduler rejects it as
+            # stale (see _run()'s own comment on the same rule) -- each macro in the chain
+            # needs its own, not a shared constant, once there can be more than one.
+            for warmup_seq, macro_name in enumerate(
+                (name.strip() for name in warmup.split(",")), start=1,
+            ):
+                if not macro_name:
+                    continue
+                # Observed live on a fresh save: a chained macro fired only 0.4s after the
+                # previous one can land before the game has actually caught up -- an unpause
+                # coming out of a fresh-save loading transition, or a tutorial prompt that
+                # renders a moment after the state change that triggers it, not instantly.
+                time.sleep(1.0)
+                macro = profile.get_macro(macro_name)
+                if scheduler.submit(replace(macro, decision_seq=warmup_seq)):
+                    print(f"warm-up macro '{macro_name}' submitted")
+                    time.sleep(macro.duration_ms / 1000.0 + 0.5)
         loop.start()
-        time.sleep(seconds)
+        if live_overlay is not None:
+            # Blocks this thread running the overlay's own event loop instead of sleeping --
+            # Tkinter requires its mainloop run on the thread that created the window, which
+            # is this one; AgentLoop's own worker threads are unaffected either way. Returns
+            # early if the window is closed, ending the session early too, same as a "wait or
+            # close to end" preview.
+            live_overlay.run_for(seconds)
+        else:
+            time.sleep(seconds)
     finally:
         loop.stop()
         sched_thread.stop()
         video.stop()
         recorder.stop()
+        if live_overlay is not None:
+            live_overlay.stop()
 
     stats = loop.stats
     capture_stats = video.stats
@@ -844,11 +961,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pattern", choices=["square", "spiral"], default="square",
                         help="movement pattern for 'agent' when --policy scripted")
     parser.add_argument("--warmup", default=None,
-                        help="macro to replay once before the loop starts, same pad session")
+                        help="one macro name, or several comma-separated (e.g. "
+                             "'toggle_pause,menu_back'), to replay once each in order before "
+                             "the loop starts, all within the same pad session")
     parser.add_argument("--verbose", action="store_true",
                         help="for 'agent': print each decision live as it happens (outcome, "
                              "latency, opening state of the proposed action) instead of only "
                              "a summary at the end")
+    parser.add_argument("--overlay", action="store_true",
+                        help="for 'agent': show a small always-on-top window with the latest "
+                             "decision's commentary, updated live as the game is played")
+    parser.add_argument("--commentary", dest="commentary_required", action="store_true",
+                        default=argparse.SUPPRESS,
+                        help="for 'agent' with --policy sdk: mark the tool schema's optional "
+                             "commentary field required, so a model actually fills it in every "
+                             "decision instead of skipping it (confirmed live, "
+                             "docs/DEV-PROCESS.md Unit 14, that 'optional' alone goes unused "
+                             "against at least one real local model regardless of prompt "
+                             "wording). Also settable via PLAYER2_COMMENTARY=1 or a .env file "
+                             "(e.g. 'true'/'false', '1'/'0', 'yes'/'no', 'on'/'off')")
+    parser.add_argument("--no-commentary", dest="commentary_required", action="store_false",
+                        default=argparse.SUPPRESS,
+                        help="override PLAYER2_COMMENTARY/.env back off for this run -- "
+                             "--commentary alone can only turn the setting on, never back off, "
+                             "since a bare flag has no way to carry an explicit False")
     parser.add_argument("--goal", default=None,
                         help="for 'agent' with --policy sdk: an explicit objective, layered on "
                              "top of the profile's agent_notes (which still supplies the "
@@ -918,7 +1054,8 @@ def main(argv: list[str] | None = None) -> int:
         cli_config = {
             key: value for key, value in vars(args).items()
             if key in ("provider", "model", "budget_tpm", "ollama_base_url",
-                       "ollama_keep_alive", "history_window", "recordings", "profile")
+                       "ollama_keep_alive", "history_window", "recordings", "profile",
+                       "commentary_required")
         }
         config = resolve_runtime_config(cli=cli_config, environ=dict(os.environ), dotenv=dotenv)
     except (ValueError, OSError) as error:
@@ -930,7 +1067,8 @@ def main(argv: list[str] | None = None) -> int:
         return agent(config.profile, args.seconds, delay, config.recordings, args.pattern,
                      args.warmup, args.policy, config.provider, config.model,
                      config.budget_tpm, config.ollama_base_url, config.ollama_keep_alive,
-                     args.verbose, args.goal, config.history_window)
+                     args.verbose, args.goal, config.history_window,
+                     config.commentary_required, args.overlay)
     if args.command == "session":
         return session(config.profile)
     if args.command == "hold":

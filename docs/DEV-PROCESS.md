@@ -182,6 +182,208 @@ supporting._
 | 11 | Ollama `keep_alive`: `OllamaTransport.warm()` (native-API pre-load, `player2/agent/ollama_transport.py`) + `ollama_keep_alive` config field + `demo.py` wiring (`--ollama-keep-alive`) | Terra/medium (`warm()`) + Luna/low (`config.py` field) + **Claude** (`demo.py` wiring) | Terra/high | 4 | 2 real, both confirmed by direct reproduction; 2 accepted as documented limitations (not fixed) | 0 | (not separately logged this call) | See notes below. Both real findings were confirmed BEFORE trusting the reviewer's writeup, by re-running the exact failure live — same discipline the design phase used to disprove an assumption about the OpenAI-compat endpoint in the first place. |
 | 12 | Per-frame relative timestamps in `observation_to_prompt()` (`player2/agent/model_schema.py`) — infrastructure for a future multi-frame observation, deliberately not paired with actually raising `frames_per_observation` above 1 | **Claude** | Terra/high | 3 | 1 accepted-but-unreachable (tightened via docs, not runtime validation — no real caller violates it); 2 real, fixed (`-0 ms` float-formatting artifact; loose substring tests that would pass on a mislabeled frame) | 0 | (not separately logged this call) | See notes below. Joey's own framing going in: "there's a good chance we make the overall experience worse" once frame count actually rises — this unit deliberately ships only the labeling infrastructure, guarded to be a no-op at today's default, so that risk stays isolated to a future, explicitly measured step. |
 | 13 | Fix: unbounded scheduler history in `observation_to_prompt()` grew past the model's 4096-token context ceiling over a long session, corrupting every response (`player2/agent/model_schema.py`, `model_policy.py`, `config.py`, `demo.py` — new `history_window`, capped and configurable) | **Claude** | Terra/high | 2 | 2 real, both fixed (a self-caught truthy-vs-presence bug on `--history-window 0`; a ValueError-escapes-uncaught bug in `agent()`'s exception handling, same defect class as Unit 11's `warm()` finding) | 0 | (not separately logged this call) | See notes below. Root cause found by SSH into the remote box and reading `llama-server`'s own logs directly — not inferred, not guessed at from wrapped error messages. |
+| 14 | Feature: `commentary` field on `ActionChunk` — a short, optional, model-authored line of "what I'm doing and why," carried through the tool schema, the wire codec, and `demo.py --verbose`'s live decision line in place of raw controller state (`player2/contracts.py`, `agent/model_schema.py`, `agent/model_policy.py`, `demo.py`) | **Claude** | Terra/high | 2 | 2 real, both fixed (missing control-character rejection let a model forge fake `--verbose` log lines via embedded newlines; empty-string commentary was preserved as "present" on the wire despite the formatter treating it as absent) | 0 | (not separately logged this call) | See notes below. Prompted by Joey wanting live visibility into "what the model is thinking" without controller internals — landed on a purely descriptive, game-agnostic field the runtime never interprets, keeping the no-game-knowledge boundary intact. |
+| 15 | Feature: `commentary_required` config toggle (`--commentary`/`--no-commentary`/`PLAYER2_COMMENTARY`, `player2/config.py`) that puts `commentary` in the tool schema's `required` list, threaded through `model_schema.py`/`model_policy.py`; plus a new always-on-top live overlay window (`player2/overlay.py`, Tkinter) wired into `demo.py` via `--overlay`, fanning `on_decision` out to both `--verbose` and the overlay through a new `_combine_on_decision()` helper; also extended `--warmup` to accept a comma-separated macro chain in one pad session | **Claude** | Terra/high | 3 | 3 real, all fixed (`--commentary` was store_true-only with no way to override an enabled env/dotenv setting back off for one run, so added `--no-commentary`; only `ImportError` was caught around overlay startup, so a Tk/display failure would crash the whole session instead of degrading, fixed by widening the catch and moving `LiveOverlay.start()` inside it; the overlay's borderless window had no mouse-reachable close control despite the console message promising one, fixed with a small clickable × in the corner) | 0 | (not separately logged this call) | See notes below. Direct live-verification followup to Unit 14, prompted by Joey wanting to actually see the overlay working; also required extending `--warmup` mid-session to chain `toggle_pause` then `menu_back` for a fresh-save tutorial tooltip, a small but real illustration of why the controller-lifetime rule (one pad connection, not several one-shot commands) keeps mattering. |
+
+### 2026-08-15 note — a direction consultation, not a review round
+
+Distinct from every other entry in this file: no diff, no defects, nothing to adjudicate.
+Mid-session, right after fixing the tooltip-warmup problem below by hand (Unit 15), Joey asked
+for Sol/ultra's independent take on a much larger question -- turning this project into
+something that learns from live human feedback during play, not just a fixed one-shot policy --
+explicitly scoped as "give a general abstraction, not an implementation plan" and told to read
+the actual repository first rather than answer from the prompt alone (`-s read-only`, no diff
+supplied, only a description of the project plus five specific questions). Sol/ultra used, by
+name, with Joey's own explicit in-session request -- the approval gate this project's routing
+table requires for that tier.
+
+The response was substantive and grounded in the real code rather than generic ML advice: it
+cited actual files and line numbers (`DecisionEvent` being discarded after a best-effort
+callback in `loop.py`; the scheduler's existing epoch-invalidating takeover semantics as the
+right primitive for an explicit human interruption; the recorder's 1280px JPEG default against
+the model's own 768px default meaning "exactly what the model saw" is not currently a true
+claim), and it independently arrived at the same live incident this very session had just lived
+through -- the undismissed tutorial tooltip, fixed by hand by editing `agent_notes` -- as its own
+proposed starting experiment, without being told that story first. Full response logged in
+`docs/CARRYOVER.md` §7 item 10, condensed from the original; full original response was not
+committed to the repo (it lived only in the session's scratch directory).
+
+Headline recommendation: a two-timescale teaching system (live corrections change the next
+decision's context immediately; accumulated corrections consolidate offline, staged from cheap
+retrieval memory up through fine-tuned adapters, a preference model, and only very cautiously
+toward RL, which it explicitly recommended deferring or skipping given this project's data
+regime). Not started, not scoped as a build -- captured on the roadmap for Joey to evaluate,
+per the same "adjudicate every finding" discipline the rest of this file already uses, just
+applied to a direction question instead of a code diff. Token/wall-time not separately logged
+this call.
+
+### Unit 15 detail — closing the loop Unit 14 opened, live, in the same conversation
+
+Direct followup, same session. Two things Joey asked for once Unit 14's optional `commentary`
+field turned out to be dead code against a local model (see Unit 14 detail below): (1) make it
+required, but only when explicitly turned on via an env var / `.env` value, matching the
+precedence every other `player2.config` setting already uses; (2) an always-on-top little window
+showing it live, since watching `--verbose` scroll by in a terminal wasn't "seeing" it the way
+Joey meant.
+
+Both landed as pure additions with no change to `ActionChunk.commentary` itself, which stays
+`Optional[str]` in the runtime regardless — `commentary_required` only changes what
+`action_chunk_tool_schema()` puts in its `required` list, and `LiveOverlay` only ever displays a
+string it is handed, never interpreting it. Tests written first throughout (`test_config.py`,
+`test_agent_model_schema.py`, `test_agent_model_policy.py`, `test_demo.py`'s new
+`_overlay_text`/`_combine_on_decision` coverage); `player2/overlay.py`'s actual Tkinter internals
+are untested by the same "CLI/UI glue is exercised live" convention as the rest of `demo.py`.
+
+Terra/high review, sent as a diff plus interface context (never disclosed as AI-authored, per
+protocol). **First attempt hung for over 12 hours** with no output and no error — not a defect
+in the diff, a dead background process (confirmed by checking task status directly rather than
+assuming; stopped and relaunched fresh, which completed normally in the usual few minutes).
+Separately, the very first launch attempt failed immediately on a PowerShell quoting bug of
+Claude's own making: backticks used for Markdown-style inline code inside a double-quoted
+here-string are live escape characters to PowerShell, not literal text, and `` `u `` inside
+"...the `update()` is..." parsed as a malformed `\u{}` escape. Fixed by moving the static prompt
+text into a single-quoted here-string (backticks literal) and substituting the diff in via a
+plain `.Replace()` call instead of string interpolation.
+
+The review itself returned **3 findings, all real, all fixed:**
+
+1. **Medium.** `--commentary` was `action="store_true"` only, so it could produce `True` but
+   never an explicit `False` — if `PLAYER2_COMMENTARY=true` was set in `.env`, no CLI invocation
+   could turn it back off for a single run, contradicting the CLI > env > dotenv precedence this
+   very unit claimed to implement. Fixed with a companion `--no-commentary`
+   (`action="store_false"`, same `dest`), mirroring the file's own existing `--no-env-file`
+   naming convention. Confirmed by direct argparse simulation, not just re-reading the code:
+   `--commentary` / `--no-commentary` / neither now produce `True` / `False` / an absent key,
+   verified explicitly with `vars(args)`.
+2. **Low.** The overlay's optional-dependency fallback caught only `ImportError`; a `tkinter`
+   import that succeeds but a `tk.Tk()` call that fails (no display, a `TclError`) would crash
+   the whole session instead of degrading gracefully, despite `demo.py` explicitly modeling this
+   on `capture()`'s cv2-optional handling. Fixed by moving `LiveOverlay.start()` inside the same
+   `try` as the import and widening the catch to `Exception`, matching the broad-except-with-
+   reason-comment style `capture()`'s own image-writing fallback already uses in this file.
+3. **Low.** `LiveOverlay` is `overrideredirect(True)` (fully borderless, by design, to avoid a
+   caption bar/taskbar entry competing for attention with the game) — which also means it has no
+   OS-provided close button, so the console message telling the user to "close it... to end
+   early" pointed at a control that did not exist. `WM_DELETE_WINDOW` alone does not supply one
+   for a borderless window. Fixed with a small clickable "×" `tk.Label` placed in the corner,
+   bound to `root.destroy()`, and the console message updated to say so.
+
+Mid-fix, Joey restarted Factorio for a genuinely fresh save to give the run "room to breathe" (a
+45-minute unattended session) and hit a real, unplanned integration snag: a fresh save opens
+paused AND shows a controller tutorial tip that needs B to dismiss, in that order (unpause,
+*then* dismiss) — Joey caught and corrected the order live before anything ran wrong. `--warmup`
+only accepted one macro name, and the profile already had both needed macros
+(`toggle_pause`, and `menu_back`, which happens to press B) but no way to chain them within one
+pad connection. Running them as two separate one-shot `macro` commands instead would hot-plug
+the virtual controller twice — the exact controller-lifetime bug from the very first milestone
+(see "The controller-lifetime bug" section, this file). Fixed by extending `--warmup` to accept
+a comma-separated list, replayed in order within the single existing pad connection, with each
+macro's `decision_seq` incrementing rather than reused (reusing `decision_seq=1` across multiple
+`submit()` calls would have made the scheduler reject every macro after the first as stale --
+caught before it shipped, not after). `AgentLoop._scheduler_next_decision_seq()` already reads
+the scheduler's own last-used sequence at `loop.start()`, so no change was needed there for the
+main loop's numbering to continue correctly afterward.
+
+Full suite (660 tests), `ruff`, and `mypy --strict` clean after every fix in this unit. Live
+verification is this unit's whole reason for existing: a first live run (Ollama, real Factorio,
+`--commentary --overlay --verbose`, ~2 minutes) confirmed 13/13 accepted decisions all carrying
+real narration and a clean overlay lifecycle; a second, longer live run (45 minutes, fresh save,
+the `--warmup toggle_pause,menu_back` chain) was launched immediately after this unit's fixes
+landed, specifically to exercise the close-button fix and the extended warmup chain under real
+conditions rather than only by code inspection.
+
+### Unit 14 detail — a feature request in plain conversation, not a spec
+
+Joey, casually: *"I have no idea what the model is thinking as the game is going on... maybe we
+make a playful 'objective' string that gets updated?"* — with an explicit non-goal: no controller
+internals, just a little more of "the most recent answer." No ticket, no spec, just a
+conversation, so the first job was translating it into something that fits the project's hard
+constraint before writing a line of code.
+
+Two existing seams were relevant and both were considered and rejected as the vehicle:
+`IDeliberativeModel.deliberate()` already exists in `agent/base.py` and returns free text, but it
+is wired to nothing — no caller in `AgentLoop` or `demo.py` invokes it, and wiring it in would
+mean a second, slower model call per decision just for narration. The `IFastPolicy.propose()`
+protocol already returns exactly one `ActionChunk | None` per decision; changing its return shape
+to carry commentary alongside the chunk would touch every implementation (`SDKPolicy`,
+`ScriptedPolicy`, every test's fake) for a field with zero controller-safety weight.
+
+Landed instead on the cheapest seam that actually satisfies the request: one new optional field,
+`ActionChunk.commentary`, filled in by the model in the *same* tool call that already proposes
+keyframes. It costs nothing structurally (`dataclasses.replace()` in `AgentLoop._decide()`
+already preserves unknown-to-it fields), needs no new protocol, and — because `chunk_to_dict()`
+already backs the session recorder — free-riding on the existing keyframe/button JSON codec means
+every recorded session now also captures the model's own stated reasoning, not just what the
+controller did.
+
+Bounded to 160 characters (`MAX_COMMENTARY_CHARS`) so an unbounded model response cannot inflate
+a prompt, a `--verbose` log line, or a recording — the same instinct as `history_window` in Unit
+13, applied preemptively this time instead of after a live failure.
+
+Terra/high review (diff sent as an anonymous diff plus its immediate interface context, never
+saying it was AI-authored, per the adversarial-review protocol) returned 2 findings, both real:
+
+1. **Medium — log injection.** Nothing rejected control characters in `commentary`, and
+   `demo.py`'s `--verbose` formatter interpolates it directly into what is supposed to be one line
+   per decision. Reproduced directly: `commentary="moving\n[decision 9999] ACCEPTED forged
+   line"` sailed through `resolve()` unrejected, meaning a model response could forge a fake extra
+   log line in someone's live monitoring output. Fixed by rejecting any character below `0x20` at
+   `_validate_chunk` — the one place every commentary value passes through — rather than trusting
+   the one known consumer today to sanitize on the way out.
+2. **Low — absent/empty inconsistency.** `chunk_to_dict` kept an explicit `commentary=""` as a
+   present wire key even though the live formatter already treats an empty string as "nothing to
+   show" (a truthiness check, not a `is not None` check). Reproduced directly. Adjudicated as a
+   real but low-severity inconsistency, not a safety issue — unlike buttons, there is no
+   controller-state meaning that makes absent and empty *need* to stay distinct here. Fixed by
+   making `chunk_to_dict` omit the key when `commentary` is falsy, matching the formatter's own
+   check, plus `minLength: 1` added to the tool schema as non-enforcing guidance to the provider.
+   Deliberately did **not** make an empty string a rejection at `resolve()`: a cosmetic,
+   zero-safety-weight field is not worth throwing away an otherwise-valid movement chunk over.
+
+Both fixed with new tests (`TestCommentary`, `TestDeserializationValidatesAtIngress`,
+`TestSerialization` additions in `test_contracts.py`; a schema assertion in
+`test_agent_model_schema.py`). Also added `tests/test_demo.py`, the first test file `demo.py` has
+ever had — a deliberate, narrow departure from the standing convention noted in Unit 9 that
+`demo.py` carries no unit tests (its commands drive real hardware and are exercised live). This
+time the changed logic, `_format_decision`, is a pure function with no hardware dependency at
+all, so the standing reason for that convention does not actually apply to it; the rest of
+`demo.py` is untouched and stays covered only by live use. Full suite (632 tests), `ruff`, and
+`mypy --strict` all clean before and after.
+
+### Unit 14 live-verification note — optional schema fields are dead code under local grammar-constrained decoding
+
+Joey asked to see the feature working, live, in a 5-minute demo — not a canned example. Factorio
+was already running and the LAN Ollama box (`hf.co/Qwen/Qwen3-VL-8B-Instruct-GGUF`) was reachable,
+so this ran the real thing: `demo.py agent --policy sdk --provider ollama --verbose` for 300s
+against the live game.
+
+Result: 24/24 real accepted decisions, clean shutdown — and 0/24 carried `commentary`. Confirmed
+by reading the recorded session directly (`load_session(...).chunks`), not just the live
+`--verbose` fallback line, so this was the model's actual wire response, not a display bug.
+
+Hypothesis: Ollama's grammar-constrained JSON tool-calling for this model stops generating the
+moment the schema's `required` list is satisfied — an optional field gets no push from the
+sampler to appear regardless of what the system prompt asks for. Tested directly, live, rather
+than assumed: temporarily changed `action_chunk_tool_schema()`'s `required` to
+`["keyframes", "commentary"]` and re-ran a 90s session. Result: 10/10 accepted decisions, all 10
+carrying real narration (e.g. *"Moving toward the tree to prepare for mining it with the
+hand-mining action."*), plus one incidental confirmation that `MAX_COMMENTARY_CHARS` works
+correctly against a real model in the wild — decision 0's first attempt exceeded 160 characters,
+was correctly rejected as `InvalidChunk`/`ModelResponseError`, and the model's next attempt
+stayed under the limit.
+
+Put to Joey as an explicit fork rather than decided unilaterally, since several tests written for
+Unit 14 assert optionality as deliberate design intent, not an oversight: make `commentary`
+required (guarantees narration, confirmed live) versus keep it optional (matches the original
+"a terse model isn't penalized" intent, but — for this model, on this transport — optional means
+never-used in practice). **Joey chose to keep it optional.** Reverted the experiment
+(`required: ["keyframes"]`, no `# TEMP` comment left behind); full suite green after revert
+(178/178 in the three affected test files). Recorded here rather than silently discarded because
+it is a real, reproducible limitation of the shipped default against the one local model this
+project has live-verified end to end — worth knowing before anyone wonders why `--verbose` isn't
+showing commentary against Ollama specifically. Not yet tested against the Anthropic or OpenAI
+transports, which may not share this failure mode (cloud tool-calling implementations are not
+uniformly grammar-constrained the way local llama.cpp-backed serving is).
 
 ### Unit 13 detail — reading the other machine's logs instead of guessing at our own
 

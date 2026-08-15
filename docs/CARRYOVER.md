@@ -242,6 +242,26 @@ full coding-agent scaffold per invocation. One decision every 2s ⇒ ~1.9M token
 3. **Wire the perceptual gate into `AgentLoop`.** Smallest of the original three levers, and
    now also what unblocks the "raise the change threshold" degrade step the governor
    currently can't use.
+3b. **Tell the model how long the scene has been static, not just whether to skip a decision.**
+   Refines item 3 with a concrete shape (proposed 2026-08-15, Joey). Reuse the *existing but
+   currently unwired* `video/fingerprint.py` (`perceptual_hash`/`has_changed` -- today only
+   `content_hash` is used, and only by the recorder's storage dedup, not by `AgentLoop` or the
+   prompt at all). Compare each decision's newest frame against the previous decision's own
+   newest frame -- no extra images sent, `frames_per_observation` stays at 1, deliberately not
+   the N=2+ approach item 7 already flagged as latency-negative. `AgentLoop` would track a
+   running "unchanged since" duration across decisions and `observation_to_prompt()` would add
+   one line (e.g. "visible scene unchanged for ~8.4s") so the model can notice a stall -- a
+   blocking menu, a stuck loading screen, a truly frozen frame -- and change its own strategy.
+   Game-agnostic: it is a fact about pixels, not an interpretation of *why* they have not
+   changed, same discipline as every other derived fact already in the prompt. Real open
+   question before building: the perceptual-hash threshold (currently 10, tuned for the
+   recorder's storage dedup; §5's live numbers show adjacent live-gameplay distance p50=9/
+   p90=14) has never been verified live for *this* purpose -- too loose and ambient animation
+   (smoke, a blinking minimap) never lets the counter accumulate; too tight and real slow
+   progress reads as "stuck." Prompted directly by a live miss: a 2026-08-15 session sat behind
+   an undismissed tutorial tooltip for several minutes while the model kept proposing plausible-
+   sounding actions against a screen that had not actually changed, with no way to know it was
+   stuck. See `docs/DEV-PROCESS.md` Unit 15 for the session this came out of.
 4. **Fix recorder frame ownership** (defect 1 above).
 5. **Keyboard/mouse adapter + text entry**, including in-game chat with the profile's opaque
    deny-pattern list (`^/` for Factorio, because its chat box is also a Lua console). Note:
@@ -283,6 +303,64 @@ full coding-agent scaffold per invocation. One decision every 2s ⇒ ~1.9M token
    complexity than a first pass warrants before knowing whether simple truncation already loses
    anything the model actually needed. Revisit once there's evidence truncation is costing
    real decision quality, not before. Full root-cause account in `docs/DEV-PROCESS.md`.
+10. **Long-term direction: learn from live human feedback during play, not just a fixed
+   one-shot policy.** Not scoped or started; this is a direction consultation, not a plan.
+   Joey asked Sol/ultra (2026-08-15) for an independent architectural take, explicitly scoped
+   as "give a general abstraction, not an implementation" and told to read the actual repo
+   first rather than answer from the prompt alone. Full response in
+   `docs/DEV-PROCESS.md`'s 2026-08-15 note; headline shape:
+
+   - **Two-timescale teaching system.** Live: a human correction (ideally a short takeover +
+     demonstration through the existing input-state abstraction, or at minimum one short
+     directive sentence) changes the *next* decision's context immediately. Offline: accumulated
+     corrections consolidate later, first into retrieval memory, then — only once enough clean
+     data exists — into a per-profile trained artifact. **No RL to start**, and skip a bare
+     scalar reward on the latest decision entirely: consequences often arrive several decisions
+     later, and a takeover can mean correction, ordinary turn-taking, or assistance, not
+     necessarily "that was wrong." Preserve the rich event; derive scalar labels later only if
+     an algorithm actually needs them.
+   - **A staged mechanism ladder, not one big choice:** profile-scoped retrieval first (cheap,
+     reversible, inspectable — but bounded, the same 4096-token-overflow lesson item 9 above
+     already paid for applies directly to "memory" too) → periodic imitation
+     fine-tuning/LoRA adapters on human corrections (DAgger-style: let the policy visit states
+     its own mistakes cause, then collect corrections there) → a preference/critic model once
+     there are enough agent-vs-correction pairs, used first to rerank and flag regressions, only
+     later to optimize anything → DPO-style tuning if paired preferred/rejected data
+     accumulates naturally → offline RL **deferred, possibly never** (narrow behavior-policy
+     coverage, partial observations, sparse feedback, no clean resets — exactly the regime
+     where offline RL is known to be fragile).
+   - **Game-agnostic split, matching the existing hard constraint exactly:** a generic runtime
+     (unchanged), a generic learning plane (trainer/evaluator/retrieval — still game-agnostic
+     code, same as everything else in `player2/`), and a versioned per-profile "specialization
+     bundle" (memories, adapters, an optional preference model) that the runtime loads as an
+     opaque artifact by profile identity, exactly mirroring how `agent_notes` already works
+     today. The runtime never branches on a game name or interprets learned content.
+   - **Smallest first step, no training infra needed:** formalize the exact loop this project
+     already ran by hand tonight. A live session sat stuck behind an undismissed tutorial
+     tooltip; the fix was a human noticing, then manually writing the lesson into
+     `profiles/factorio.toml`'s `agent_notes` (see `docs/DEV-PROCESS.md` Unit 15). Sol/ultra's
+     proposed experiment: let a human issue one live correction ("remember: when this popup
+     appears, press B before anything else"), persist it with decision/time provenance under
+     the profile's own scope, retrieve it into a small dedicated memory section on a **fresh
+     process**, and compare memory-on vs. memory-off trials. Success is measured as fewer
+     interventions and the correct input followed by the expected visual change — not accepted
+     chunks, not commentary, not a claim that the model "remembered." This tests the hardest
+     real assumptions (feedback ergonomics, causal anchoring, persistence, bounded recall,
+     fresh-process specialization, evidence-based evaluation) before any training pipeline gets
+     built at all.
+   - **Prerequisites flagged as real gaps, not nitpicks:** the manifest records
+     policy/provider but not the actual model checkpoint, prompt version, or sampling config —
+     without that, future training/regression analysis is guesswork. Errors, `None` decisions,
+     cancellations, and rejected proposals currently vanish rather than persisting — a decision
+     stream is more foundational than a reward stream since feedback needs something
+     unambiguous to target. The known "recorder only captures ~23% of frames" defect (§6 item
+     1) blocks reconstructing real correction trajectories, not just replay fidelity. The
+     recorder defaults to 1280px JPEGs while the model sees 768px — "exactly what the model
+     saw" is not currently a true claim and would need to be before training on it. And: never
+     auto-promote screen text or model-authored commentary into permanent memory without an
+     explicit human approval step — screen text is already-flagged untrusted model input (see
+     the prompt-injection note in `docs/DEV-PROCESS.md`), and commentary is provenance, not
+     ground truth.
 
 Also planned: **a GitHub docs page**, so keep documenting decisions in a form that lifts out.
 

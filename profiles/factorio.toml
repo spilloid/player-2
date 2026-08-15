@@ -40,6 +40,13 @@ Controller bindings (Factorio's defaults, read from config.ini, not guessed):
   see more of the factory when the view feels too close to plan placement or pathing.
   Pausing and closing a menu are handled by this profile's own macros, not raw buttons.
 
+If any on-screen text names a specific button to press (a tutorial hint, a "press B to
+continue" style prompt, a confirmation dialog), press exactly that button next -- read the
+letter or symbol shown and match it to the bindings above rather than guessing A, START, or
+any other button. B in particular backs out of or dismisses a menu or prompt; if the screen
+still shows the same prompt after a press, it likely did not register -- press the same
+button again rather than switching to a different one.
+
 The minimap/radar panel in the top-right corner shows a zoomed-out view of scouted terrain:
 ore patches appear as colored dots matching their resource type, and any explored enemy
 (biter) bases show up there too once within radar or vision range. Check it when deciding
