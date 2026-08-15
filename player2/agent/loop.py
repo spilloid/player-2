@@ -6,7 +6,9 @@ import math
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Protocol
 
 from player2.agent.base import IFastPolicy, Observation
@@ -68,6 +70,32 @@ class AgentStats:
     last_policy_error: str | None
 
 
+class DecisionOutcome(StrEnum):
+    """Describe what one decision cycle actually did, for a live observer."""
+
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    NONE = "none"
+    ERROR = "error"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True)
+class DecisionEvent:
+    """Report one decision cycle to an optional live observer (e.g. a CLI --verbose flag).
+
+    Distinct from `AgentStats`: stats are a cumulative snapshot polled after the fact, this is
+    a per-cycle notification for someone watching a session happen in real time -- the model's
+    thinking is otherwise invisible until the run ends and the summary line prints.
+    """
+
+    decision_seq: int
+    elapsed_ms: float
+    outcome: DecisionOutcome
+    chunk: ActionChunk | None = None
+    detail: str | None = None
+
+
 class AgentLoop:
     """Run policy work beside the scheduler and preserve executed-event provenance.
 
@@ -87,6 +115,7 @@ class AgentLoop:
         min_interval_ms: float = _DEFAULT_MIN_INTERVAL_MS,
         frames_per_observation: int = _DEFAULT_FRAMES_PER_OBSERVATION,
         governor: IBudgetGovernor | None = None,
+        on_decision: Callable[[DecisionEvent], None] | None = None,
     ) -> None:
         """Prepare an idle loop with bounded history and caller-owned dependencies.
 
@@ -125,6 +154,7 @@ class AgentLoop:
         self._min_interval_ms = interval_ms
         self._frames_per_observation = frames_per_observation
         self._governor = governor
+        self._on_decision = on_decision
         self._history: deque[SchedulerEvent] = deque(maxlen=_HISTORY_CAPACITY)
         self._history_lock = threading.Lock()
         self._next_decision_seq = self._scheduler_next_decision_seq()
@@ -262,12 +292,27 @@ class AgentLoop:
             epoch=epoch,
             decision_seq=decision_seq,
         )
+        decide_start = time.monotonic()
         try:
             proposal = self._policy.propose(observation)
         except Exception as error:
+            elapsed_ms = (time.monotonic() - decide_start) * 1000.0
             self._record_policy_error(error)
+            self._report_decision(decision_seq, elapsed_ms, DecisionOutcome.ERROR,
+                                  detail=_describe(error))
             return
-        if proposal is None or self._stop_event.is_set():
+        # Captured once, immediately when propose() returns -- every _report_decision call
+        # below reuses this same value so elapsed_ms always means "how long policy.propose()
+        # took," never inflated by whatever scheduler/recorder work happens afterward.
+        elapsed_ms = (time.monotonic() - decide_start) * 1000.0
+        if self._stop_event.is_set():
+            # Distinct from NONE: the policy may have returned a real proposal here, just too
+            # late to matter -- shutdown discards it regardless of what it was. Reporting NONE
+            # would falsely claim the model proposed nothing when it may well have.
+            self._report_decision(decision_seq, elapsed_ms, DecisionOutcome.CANCELLED)
+            return
+        if proposal is None:
+            self._report_decision(decision_seq, elapsed_ms, DecisionOutcome.NONE)
             return
 
         self._increment("chunks_proposed")
@@ -280,6 +325,7 @@ class AgentLoop:
             )
         except Exception:
             self._increment("chunks_rejected")
+            self._report_decision(decision_seq, elapsed_ms, DecisionOutcome.REJECTED)
             return
 
         # This is the acceptance instant, sampled before submit. Sampling after submit can
@@ -288,11 +334,13 @@ class AgentLoop:
         accepted = self._scheduler.submit(stamped)
         if not accepted:
             self._increment("chunks_rejected")
+            self._report_decision(decision_seq, elapsed_ms, DecisionOutcome.REJECTED)
             return
         self._record_chunk(accepted_at_ms, stamped)
         # This counter describes scheduler admission, not eventual device execution. The pad
         # stream and scheduler events carry the separate evidence of what actually happened.
         self._increment("chunks_accepted")
+        self._report_decision(decision_seq, elapsed_ms, DecisionOutcome.ACCEPTED, chunk=stamped)
 
     def _drain_events(self) -> None:
         """Drain once and fan out, preventing split execution history between consumers."""
@@ -364,6 +412,29 @@ class AgentLoop:
         with self._stats_lock:
             self._policy_errors += 1
             self._last_policy_error = detail
+
+    def _report_decision(
+        self, decision_seq: int, elapsed_ms: float, outcome: DecisionOutcome,
+        *, chunk: ActionChunk | None = None, detail: str | None = None,
+    ) -> None:
+        """Notify an optional live observer, best-effort -- purely external visibility (e.g. a
+        CLI --verbose flag), the same non-blocking-observer discipline record_event/
+        record_chunk already use for the recorder. A broken observer must never affect
+        cognition, so its exception is swallowed here rather than surfaced anywhere.
+
+        `elapsed_ms` is the caller's responsibility to compute once, immediately when
+        `policy.propose()` returns or raises -- not recomputed here from some earlier start
+        time, which would silently fold in whatever scheduler/recorder work ran afterward.
+        """
+        callback = self._on_decision
+        if callback is None:
+            return
+        event = DecisionEvent(decision_seq=decision_seq, elapsed_ms=elapsed_ms,
+                              outcome=outcome, chunk=chunk, detail=detail)
+        try:
+            callback(event)
+        except Exception:
+            pass
 
     def _set_last_error(self, error: BaseException) -> None:
         """Expose daemon-worker death because silent cognition loss leaves no safe witness."""

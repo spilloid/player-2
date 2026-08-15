@@ -24,12 +24,13 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import FrozenInstanceError
+from typing import Any
 
 import pytest
 
 from player2.agent.base import IFastPolicy, Observation
 from player2.agent.fast_stub import ScriptedPolicy
-from player2.agent.loop import AgentLoop
+from player2.agent.loop import AgentLoop, DecisionEvent, DecisionOutcome
 from player2.clock import SessionClock
 from player2.contracts import ActionChunk, Keyframe
 from player2.control.null import NullControllerAdapter
@@ -58,16 +59,16 @@ class RecordingPolicy:
         return self.result
 
 
-def build(policy: object, *, clock: object | None = None) -> tuple[AgentLoop, Scheduler,
-                                                                   FakeVideoSource,
-                                                                   NullControllerAdapter]:
+def build(policy: object, *, clock: object | None = None,
+          **loop_kwargs: Any) -> tuple[AgentLoop, Scheduler, FakeVideoSource,
+                                        NullControllerAdapter]:
     the_clock = clock if clock is not None else SessionClock()
     output = NullControllerAdapter()
     scheduler = Scheduler(output=output, clock=the_clock, max_hold_ms=250.0)  # type: ignore[arg-type]
     video = FakeVideoSource(clock=the_clock)  # type: ignore[arg-type]
     video.start()
     loop = AgentLoop(policy=policy, video=video, scheduler=scheduler,  # type: ignore[arg-type]
-                     clock=the_clock, goal="test goal")  # type: ignore[arg-type]
+                     clock=the_clock, goal="test goal", **loop_kwargs)  # type: ignore[arg-type]
     return loop, scheduler, video, output
 
 
@@ -342,6 +343,157 @@ class TestLoopIsolatesCognitionFromTheHands:
         loop.stop()
         loop.stop()
         assert loop.is_running is False
+
+
+class TestLoopReportsDecisionsLive:
+    """`on_decision` exists for one reason: a human watching a live run has no way to know what
+    the model is doing until the session ends and the summary stats print. Every outcome a
+    decision cycle can reach must be observable as it happens, not just counted."""
+
+    def test_reports_an_accepted_decision_with_the_chunk_and_timing(self) -> None:
+        events: list[DecisionEvent] = []
+        loop, _, video, _ = build(RecordingPolicy(result=walk()), on_decision=events.append)
+        video.emit(1)
+        loop.start()
+        try:
+            deadline = time.time() + 3.0
+            while time.time() < deadline and not events:
+                time.sleep(0.01)
+        finally:
+            loop.stop()
+        assert events, "no decision was ever reported"
+        accepted = [e for e in events if e.outcome == DecisionOutcome.ACCEPTED]
+        assert accepted, f"expected an ACCEPTED event, got outcomes: {[e.outcome for e in events]}"
+        assert accepted[0].chunk is not None
+        assert accepted[0].elapsed_ms >= 0.0
+
+    def test_reports_none_when_the_policy_proposes_nothing(self) -> None:
+        events: list[DecisionEvent] = []
+        loop, _, video, _ = build(RecordingPolicy(result=None), on_decision=events.append)
+        video.emit(1)
+        loop.start()
+        try:
+            deadline = time.time() + 3.0
+            while time.time() < deadline and not events:
+                time.sleep(0.01)
+        finally:
+            loop.stop()
+        assert events
+        assert events[0].outcome == DecisionOutcome.NONE
+        assert events[0].chunk is None
+
+    def test_reports_error_with_detail_when_the_policy_raises(self) -> None:
+        class AlwaysRaises:
+            def propose(self, observation: Observation) -> ActionChunk | None:
+                raise RuntimeError("a distinctive live-visible failure")
+
+        events: list[DecisionEvent] = []
+        loop, _, video, _ = build(AlwaysRaises(), on_decision=events.append)
+        video.emit(1)
+        loop.start()
+        try:
+            deadline = time.time() + 3.0
+            while time.time() < deadline and not events:
+                time.sleep(0.01)
+        finally:
+            loop.stop()
+        assert events
+        assert events[0].outcome == DecisionOutcome.ERROR
+        assert events[0].detail is not None
+        assert "a distinctive live-visible failure" in events[0].detail
+
+    def test_reports_rejected_when_the_scheduler_declines(self) -> None:
+        events: list[DecisionEvent] = []
+        loop, _, video, _ = build(
+            ScriptedPolicy([ActionChunk(keyframes=())]), on_decision=events.append,
+        )
+        video.emit(1)
+        loop.start()
+        try:
+            deadline = time.time() + 3.0
+            while time.time() < deadline and not events:
+                time.sleep(0.01)
+        finally:
+            loop.stop()
+        assert events
+        assert events[0].outcome == DecisionOutcome.REJECTED
+
+    def test_elapsed_ms_reflects_the_policys_think_time_specifically(self) -> None:
+        """elapsed_ms must measure only policy.propose()'s duration -- not the scheduler
+        submission, recorder queueing, or stats-lock work that happens afterward for ACCEPTED/
+        REJECTED. Those stages are near-instant in practice, but the measurement window must be
+        scoped correctly by construction (captured once, immediately when propose() returns),
+        not accidentally correct only because the extra work happens to be cheap."""
+        class SlowPolicy:
+            def propose(self, observation: Observation) -> ActionChunk | None:
+                time.sleep(0.15)
+                return walk()
+
+        events: list[DecisionEvent] = []
+        loop, _, video, _ = build(SlowPolicy(), on_decision=events.append)
+        video.emit(1)
+        loop.start()
+        try:
+            deadline = time.time() + 3.0
+            while time.time() < deadline and not events:
+                time.sleep(0.01)
+        finally:
+            loop.stop()
+        assert events
+        assert 100.0 <= events[0].elapsed_ms <= 400.0, (
+            f"elapsed_ms={events[0].elapsed_ms} does not reflect the 150ms propose() sleep"
+        )
+
+    def test_a_real_proposal_during_shutdown_is_not_mislabeled_none(self) -> None:
+        """`proposal is None` (the model chose not to act) and `stop_event.is_set()` (the loop
+        is shutting down and will discard whatever comes back regardless) are different reasons
+        a chunk never reaches the scheduler. Conflating them into the same NONE outcome would
+        report "the model proposed nothing" for a case where it actually did -- exactly the
+        kind of false live signal --verbose exists to avoid."""
+        release = threading.Event()
+
+        class BlockingPolicy:
+            def propose(self, observation: Observation) -> ActionChunk | None:
+                release.wait(timeout=2.0)
+                return walk()
+
+        events: list[DecisionEvent] = []
+        loop, _, video, _ = build(BlockingPolicy(), on_decision=events.append)
+        video.emit(1)
+        loop.start()
+        time.sleep(0.1)  # let _decide() actually enter propose() before stopping
+        stop_thread = threading.Thread(target=loop.stop)
+        stop_thread.start()
+        time.sleep(0.05)
+        release.set()
+        stop_thread.join(timeout=3.0)
+        assert events, "no decision was ever reported"
+        assert events[0].outcome == DecisionOutcome.CANCELLED, (
+            f"a real proposal during shutdown must not read as NONE, got {events[0].outcome}"
+        )
+
+    def test_a_broken_callback_does_not_stop_the_loop(self) -> None:
+        """Purely an external observer, same non-blocking-best-effort discipline the recorder
+        callbacks already use -- a bug in whatever is watching (e.g. a --verbose print) must
+        never be able to take cognition down with it."""
+        calls = {"count": 0}
+
+        def poison(event: DecisionEvent) -> None:
+            calls["count"] += 1
+            raise RuntimeError("broken observer")
+
+        policy = RecordingPolicy(result=walk())
+        loop, _, video, _ = build(policy, on_decision=poison)
+        video.emit(1)
+        loop.start()
+        try:
+            deadline = time.time() + 3.0
+            while time.time() < deadline and calls["count"] < 2:
+                time.sleep(0.01)
+        finally:
+            loop.stop()
+        assert calls["count"] >= 2, "the loop died after the first broken callback invocation"
+        assert loop.stats.last_error is None
 
 
 class TestHistoryIsWhatHappenedNotWhatWasIntended:

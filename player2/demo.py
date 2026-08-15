@@ -33,7 +33,10 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from player2.agent.loop import DecisionEvent
 
 from player2.clock import SessionClock
 from player2.config import load_dotenv_file, resolve_runtime_config
@@ -319,6 +322,7 @@ _SDK_TIMEOUT_S = 90.0
 def _build_sdk_policy(
     provider: str, model: str | None, budget_tpm: float, clock: object, agent_notes: str | None,
     ollama_base_url: str | None = None, ollama_keep_alive: str | None = None,
+    goal_override: str | None = None, history_window: int | None = None,
 ) -> tuple[object, object, str | None]:
     """Build a governed SDKPolicy for the requested provider.
 
@@ -373,16 +377,74 @@ def _build_sdk_policy(
         clock=clock,  # type: ignore[arg-type]
     )
     governed = GovernedTransport(inner=transport, governor=governor)
-    policy = SDKPolicy(transport=governed, timeout_s=_SDK_TIMEOUT_S)
+    sdk_kwargs: dict[str, Any] = {}
+    # Presence check, not truthiness: unlike ollama_base_url/ollama_keep_alive (strings, where
+    # "" and None are both meaningless), history_window is an int where 0 is a real, if
+    # invalid, value someone could explicitly pass. `if history_window:` would silently drop
+    # an explicit 0 and let SDKPolicy's own default win instead of raising the validation
+    # error 0 deserves -- exactly the absent-vs-empty defect class this project has hit before.
+    if history_window is not None:
+        sdk_kwargs["history_window"] = history_window
+    policy = SDKPolicy(transport=governed, timeout_s=_SDK_TIMEOUT_S, **sdk_kwargs)
     goal = agent_notes if agent_notes else "Play the game shown in the frames."
+    if goal_override:
+        # Additive, never a replacement: agent_notes carries the controller bindings the
+        # model needs to act at all (move/mine/zoom/etc.), not just the profile's own default
+        # objective. Overriding the whole string would silently strip those bindings; this
+        # keeps them and layers a stronger, explicit instruction on top, exactly the case the
+        # profile's own "absent any goal a session sets explicitly" wording anticipates.
+        goal = (f"{goal}\n\nSession objective (overrides any other suggested objective "
+                f"above): {goal_override}")
     return policy, governor, goal
+
+
+def _format_channel(value: object) -> str:
+    """Preserve the absent-vs-empty distinction on screen: `None` means inherit, an explicit
+    empty collection means release/hold-neutral -- collapsing them to the same text would hide
+    exactly the thing worth watching a live decision for."""
+    if value is None:
+        return "inherit"
+    if isinstance(value, frozenset):
+        return "[" + ", ".join(sorted(item.value for item in value)) + "]"
+    if isinstance(value, tuple):
+        return "(" + ", ".join(f"{axis:.2f}" for axis in value) + ")"
+    return str(value)
+
+
+def _format_decision(event: DecisionEvent) -> str:
+    """Render one DecisionEvent as a single readable line for --verbose live output.
+
+    Shows only the opening state of the first keyframe plus total duration -- a deliberate
+    summary for a terse one-line-per-decision view, not the full multi-keyframe chunk (which
+    the callback's caller still has, via event.chunk, if a fuller view is ever wanted).
+    """
+    from player2.agent.loop import DecisionOutcome
+
+    outcome = event.outcome
+    label = (f"[decision {event.decision_seq:>4}] "
+             f"{event.elapsed_ms / 1000.0:6.1f}s  {outcome.value.upper():<9}")
+    if outcome == DecisionOutcome.ACCEPTED and event.chunk is not None:
+        first = event.chunk.keyframes[0]
+        duration = event.chunk.keyframes[-1].t_ms
+        return (f"{label} left_stick={_format_channel(first.left_stick)} "
+                f"buttons={_format_channel(first.buttons)} duration={duration:g}ms")
+    if outcome == DecisionOutcome.ERROR and event.detail:
+        return f"{label} {event.detail}"
+    if outcome == DecisionOutcome.NONE:
+        return f"{label} (model proposed nothing this cycle)"
+    if outcome == DecisionOutcome.REJECTED:
+        return f"{label} (scheduler declined)"
+    if outcome == DecisionOutcome.CANCELLED:
+        return f"{label} (session stopped before this decision landed)"
+    return label
 
 
 def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
           pattern: str = "square", warmup: str | None = None, policy_kind: str = "scripted",
           provider: str = "anthropic", model: str | None = None,
           budget_tpm: float = 60_000.0, ollama_base_url: str | None = None,
-          ollama_keep_alive: str | None = None) -> int:
+          ollama_keep_alive: str | None = None, verbose: bool = False,
+          goal_override: str | None = None, history_window: int | None = None) -> int:
     """The whole loop, end to end: see the game, decide, act, and record all of it.
 
     Capture -> policy -> action chunk -> scheduler -> virtual pad -> game, with every frame,
@@ -431,6 +493,16 @@ def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
         recorder.stop()
         return 1
 
+    # flush=True matters here specifically: Python block-buffers stdout whenever it isn't a
+    # live terminal (piped, redirected to a file, or run under a background task runner), so
+    # without it every one of these lines would sit unflushed until the buffer filled or the
+    # process exited -- silently defeating the entire point of --verbose, which is seeing each
+    # decision AS it happens rather than as one dump at the end. Confirmed live: a real
+    # 10-minute backgrounded run produced 45 real decisions with zero visible output until this
+    # fix, even though the recorder (a separate, unbuffered file-write path) showed real-time
+    # progress the whole time.
+    on_decision = (lambda event: print(_format_decision(event), flush=True)) if verbose else None
+
     # RecordingOutput wraps the real pad, so what gets recorded is what the device was
     # actually told to do -- not what the policy asked for. Those differ constantly.
     output = RecordingOutput(inner=ViGEmXboxAdapter(), recorder=recorder, clock=clock)
@@ -446,9 +518,15 @@ def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
             sdk_policy, governor, goal = _build_sdk_policy(
                 provider, model, budget_tpm, clock,
                 profile.agent_notes if profile else None,
-                ollama_base_url, ollama_keep_alive,
+                ollama_base_url, ollama_keep_alive, goal_override, history_window,
             )
-        except ImportError as error:
+        except (ImportError, ValueError) as error:
+            # ValueError alongside ImportError: config.py's own coercion only validates that
+            # history_window/budget_tpm parse as the right type, not that they're in-range --
+            # a bad-but-well-typed value (e.g. --history-window 0) only gets caught here, by
+            # SDKPolicy's own construction-time validation, well after recorder/video already
+            # started. Without this, that ValueError would escape agent() entirely and skip
+            # the cleanup below -- the same defect class already fixed for warm() this session.
             print(f"could not build the '{provider}' policy: {error}")
             recorder.stop()
             video.stop()
@@ -457,12 +535,14 @@ def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
                          clock=clock, goal=goal, recorder=recorder,
                          min_interval_ms=_SDK_BASE_INTERVAL_MS,
                          frames_per_observation=_SDK_FRAMES_PER_OBSERVATION,
-                         governor=governor)  # type: ignore[arg-type]
+                         governor=governor,  # type: ignore[arg-type]
+                         on_decision=on_decision)
     elif pattern == "spiral":
         chunks = spiral_chunks()
         goal, interval = "walk an expanding spiral over new ground", 700.0
         loop = AgentLoop(policy=ScriptedPolicy(chunks), video=video, scheduler=scheduler,
-                         clock=clock, goal=goal, recorder=recorder, min_interval_ms=interval)
+                         clock=clock, goal=goal, recorder=recorder, min_interval_ms=interval,
+                         on_decision=on_decision)
     else:
         chunks = [
             ActionChunk(keyframes=(Keyframe(t_ms=0.0, left_stick=v), Keyframe(t_ms=800.0)))
@@ -470,7 +550,8 @@ def agent(profile_path: str | None, seconds: float, delay: float, out_dir: str,
         ]
         goal, interval = "walk in a square", 800.0
         loop = AgentLoop(policy=ScriptedPolicy(chunks), video=video, scheduler=scheduler,
-                         clock=clock, goal=goal, recorder=recorder, min_interval_ms=interval)
+                         clock=clock, goal=goal, recorder=recorder, min_interval_ms=interval,
+                         on_decision=on_decision)
 
     sched_thread.start()
     try:
@@ -764,6 +845,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="movement pattern for 'agent' when --policy scripted")
     parser.add_argument("--warmup", default=None,
                         help="macro to replay once before the loop starts, same pad session")
+    parser.add_argument("--verbose", action="store_true",
+                        help="for 'agent': print each decision live as it happens (outcome, "
+                             "latency, opening state of the proposed action) instead of only "
+                             "a summary at the end")
+    parser.add_argument("--goal", default=None,
+                        help="for 'agent' with --policy sdk: an explicit objective, layered on "
+                             "top of the profile's agent_notes (which still supplies the "
+                             "controller bindings) rather than replacing it")
+    parser.add_argument("--history-window", type=int, default=argparse.SUPPRESS,
+                        help="for 'agent' with --policy sdk: how many of the most recent "
+                             "scheduler-history events to include in the prompt (default 30). "
+                             "Confirmed live that unbounded history eventually exceeds a "
+                             "model's context window and corrupts every response -- lower "
+                             "this on a smaller context, raise it on a bigger one")
     parser.add_argument("--policy", choices=["scripted", "sdk"], default="scripted",
                         help="'scripted' needs no credentials; 'sdk' runs a real governed "
                              "model policy for 'agent'")
@@ -823,7 +918,7 @@ def main(argv: list[str] | None = None) -> int:
         cli_config = {
             key: value for key, value in vars(args).items()
             if key in ("provider", "model", "budget_tpm", "ollama_base_url",
-                       "ollama_keep_alive", "recordings", "profile")
+                       "ollama_keep_alive", "history_window", "recordings", "profile")
         }
         config = resolve_runtime_config(cli=cli_config, environ=dict(os.environ), dotenv=dotenv)
     except (ValueError, OSError) as error:
@@ -834,7 +929,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "agent":
         return agent(config.profile, args.seconds, delay, config.recordings, args.pattern,
                      args.warmup, args.policy, config.provider, config.model,
-                     config.budget_tpm, config.ollama_base_url, config.ollama_keep_alive)
+                     config.budget_tpm, config.ollama_base_url, config.ollama_keep_alive,
+                     args.verbose, args.goal, config.history_window)
     if args.command == "session":
         return session(config.profile)
     if args.command == "hold":

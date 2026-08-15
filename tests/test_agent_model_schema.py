@@ -109,6 +109,79 @@ class TestObservationToPrompt:
     def test_never_raises_on_an_empty_observation(self) -> None:
         observation_to_prompt(observation(goal=None, history=(), frames=()))
 
+    def test_history_defaults_to_a_bounded_recent_window(self) -> None:
+        """Confirmed live (docs/DEV-PROCESS.md): unbounded history text grows ~20 tokens per
+        decision and eventually exceeds the model's 4096-token context entirely on its own,
+        which corrupts every subsequent tool-call response mid-generation rather than failing
+        cleanly. Only the most recent events belong in the prompt -- older ones are dropped,
+        not the newest, since "did my last command land" matters far more than history from
+        many decisions ago."""
+        events = tuple(
+            SchedulerEvent(kind=EventKind.PREEMPTED, session_ms=float(i), detail=f"chunk seq={i}")
+            for i in range(50)
+        )
+        text = observation_to_prompt(observation(history=events))
+        assert "seq=49" in text  # newest event survives
+        assert "seq=0" not in text  # oldest event was dropped
+
+    def test_history_window_is_configurable(self) -> None:
+        events = tuple(
+            SchedulerEvent(kind=EventKind.PREEMPTED, session_ms=float(i), detail=f"chunk seq={i}")
+            for i in range(10)
+        )
+        text = observation_to_prompt(observation(history=events), history_window=3)
+        assert "seq=9" in text
+        assert "seq=8" in text
+        assert "seq=7" in text
+        assert "seq=6" not in text
+
+    def test_history_shorter_than_the_window_is_shown_in_full_unmarked(self) -> None:
+        """No spurious "omitted" note when nothing was actually dropped -- a caller reading
+        the prompt should not have to wonder whether 0 is a real omission count."""
+        events = (SchedulerEvent(kind=EventKind.DEADMAN, session_ms=1.0, detail="released"),)
+        text = observation_to_prompt(observation(history=events), history_window=30)
+        assert "omitted" not in text.lower()
+        assert "released" in text
+
+    def test_history_window_must_be_a_positive_integer(self) -> None:
+        for bad in (0, -1, 1.5, True):
+            with pytest.raises(ValueError):
+                observation_to_prompt(observation(), history_window=bad)  # type: ignore[arg-type]
+
+    def test_labels_each_frame_with_its_time_relative_to_the_cutoff_when_there_are_several(
+        self,
+    ) -> None:
+        """`IVideoSource.latest()` guarantees chronological order (oldest to newest), and
+        `observation_to_images()` preserves that order into the images sent to the model --
+        this must give the model a relative timestamp per frame in the SAME order, or a
+        multi-frame observation is just N unlabeled stills with no way to judge motion between
+        them, which is the whole point of ever sending more than one. Checked as exact lines,
+        not loose substrings -- a substring match would still pass if a label were attached to
+        the wrong frame."""
+        frames = (
+            solid_frame(0, 100.0), solid_frame(1, 350.0), solid_frame(2, 620.0),
+        )
+        text = observation_to_prompt(observation(frames=frames, cutoff=620.0))
+        lines = text.splitlines()
+        assert "  frame 1: -520 ms" in lines
+        assert "  frame 2: -270 ms" in lines
+        assert "  frame 3: 0 ms" in lines
+
+    def test_a_frame_fractionally_before_the_cutoff_never_renders_as_negative_zero(self) -> None:
+        """A frame captured less than 0.5ms before the cutoff rounds to 0ms -- Python's own
+        float formatting (`f"{-0.3:.0f}"` == "-0") would render that as the confusing,
+        ambiguous "-0 ms" if relative offsets were formatted as floats directly."""
+        frames = (solid_frame(0, 619.7), solid_frame(1, 620.0))
+        text = observation_to_prompt(observation(frames=frames, cutoff=620.0))
+        assert "-0" not in text
+
+    def test_single_frame_observation_gets_no_per_frame_breakdown(self) -> None:
+        """The current default is exactly one frame per decision -- this labeling must add
+        nothing (no extra tokens, no behavior change) to that baseline. Only worth doing once
+        frames_per_observation is deliberately raised above 1."""
+        text = observation_to_prompt(observation(frames=(solid_frame(0, 100.0),), cutoff=100.0))
+        assert "relative to" not in text.lower()
+
 
 class TestObservationToImages:
     def test_returns_one_encoded_image_per_frame(self) -> None:

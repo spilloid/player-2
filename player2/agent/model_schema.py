@@ -19,6 +19,13 @@ ACTION_CHUNK_TOOL_NAME = "submit_action_chunk"
 
 _DEFAULT_IMAGE_MAX_DIM = 768
 _DEFAULT_JPEG_QUALITY = 85
+# Confirmed live (docs/DEV-PROCESS.md): unbounded history text grows ~20 tokens per decision
+# and eventually exceeds this project's 4096-token context ceiling on its own, corrupting
+# every subsequent tool-call response mid-generation. 30 events costs roughly 400-600 tokens
+# at the observed ~15-20 tokens/event, leaving comfortable margin alongside a ~1700-token
+# image and ~700-900 tokens of agent_notes/goal. Tied to today's known ceiling, not a law of
+# nature -- raise it freely on hardware with more context room.
+_DEFAULT_HISTORY_WINDOW = 30
 
 
 class ModelResponseError(RuntimeError):
@@ -80,8 +87,13 @@ def action_chunk_tool_schema() -> dict[str, Any]:
     }
 
 
-def observation_to_prompt(observation: Observation) -> str:
+def observation_to_prompt(
+    observation: Observation, *, history_window: int = _DEFAULT_HISTORY_WINDOW,
+) -> str:
     """Render goal, timing, frame provenance, and executed scheduler evidence as text."""
+    if (isinstance(history_window, bool) or not isinstance(history_window, int)
+            or history_window <= 0):
+        raise ValueError("history_window must be a positive integer")
     goal = observation.goal if observation.goal is not None else "No goal is currently set."
     remaining_ms = observation.deadline_ms - observation.observation_cutoff_ms
     lines = [
@@ -90,12 +102,44 @@ def observation_to_prompt(observation: Observation) -> str:
         f"Observation cutoff: {observation.observation_cutoff_ms:g} ms.",
         f"Remaining decision budget from that cutoff: {remaining_ms:g} ms.",
         f"Controller epoch: {observation.epoch}; decision sequence: {observation.decision_seq}.",
-        "Recent scheduler execution history (oldest to newest):",
     ]
-    if observation.history:
+    # Only worth the extra tokens once there is more than one frame to relate to another --
+    # at the current default (one frame per decision) this adds nothing to the prompt, so
+    # raising frames_per_observation is the only thing that turns this section on.
+    # IVideoSource.latest()'s documented contract guarantees ascending session_ms (this
+    # project's only real implementation, WGC, rejects backwards session times outright), and
+    # observation_to_images() preserves that same tuple order into the images actually sent, so
+    # frame N in this list is image N in the request, oldest first -- unlabeled, a multi-frame
+    # observation is just N stills with no way to judge motion between them. This function
+    # trusts that ordering rather than re-deriving it; it is not re-validated here because
+    # AgentLoop._decide() is the only real constructor of an Observation in this codebase, and
+    # it derives observation_cutoff_ms from the same max() that ordering guarantees is the
+    # tuple's last element.
+    if len(observation.frames) > 1:
+        lines.append(
+            "Frames are supplied oldest to newest, in this order, each labeled with its "
+            "capture time relative to the observation cutoff above (0 ms = the newest frame) "
+            "so motion between them can be judged accurately:"
+        )
+        lines.extend(
+            # round() to a plain int, not float :g formatting -- int 0 never prints "-0" the
+            # way f"{-0.3:.0f}" would for a frame captured a fraction of a millisecond early,
+            # and sub-millisecond precision has no motor-timing meaning here anyway.
+            f"  frame {index + 1}: "
+            f"{round(frame.session_ms - observation.observation_cutoff_ms)} ms"
+            for index, frame in enumerate(observation.frames)
+        )
+    lines.append("Recent scheduler execution history (oldest to newest):")
+    history = observation.history[-history_window:]
+    omitted = len(observation.history) - len(history)
+    if history:
+        if omitted > 0:
+            lines.append(
+                f"  ({omitted} older event(s) omitted to fit the model's context budget)"
+            )
         lines.extend(
             f"- {event.session_ms:g} ms: {event.kind.value}: {event.detail}"
-            for event in observation.history
+            for event in history
         )
     else:
         lines.append("- No recent scheduler events.")

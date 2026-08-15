@@ -180,6 +180,139 @@ supporting._
 | 9 | Remote-host config layer: `player2/config.py` (CLI > env var > `.env` > default precedence) + `demo.py` CLI wiring for a LAN Ollama endpoint (`--ollama-base-url`, `--env-file`/`--no-env-file`) | Terra/medium (`config.py`) + **Claude** (`demo.py` wiring, inverted routing) | Terra/high (design consult + both diffs) + Claude (`config.py` review) | 1 (`demo.py` review) | 1, confirmed by direct reproduction | 0 — `demo.py` has no test file by standing project convention | 7,013 (design) + 28,655 (`config.py` impl) + 34,198 (`demo.py` review) = 69,866 | See notes below. First unit mixing a Codex-authored file with a Claude-authored file in the same unit, both reviewed by Codex. |
 | 10 | Fix: `AgentLoop._decide()` silently discarded policy-error exception detail (`player2/agent/loop.py`) | **Claude** (inverted routing — `loop.py` has a real suite) | Terra/high | 2 | 1 real, confirmed by direct reproduction; 1 rejected (hypothetical positional-construction compatibility, no such caller exists) | 0 | 49,879 (review) | See notes below. The fix's first draft introduced a worse bug than the one it fixed — an unprotected `str(error)` call turned a poisoned exception's broken `__str__` into full worker-thread death, caught only because the diff was reviewed instead of trusted on a passing test. |
 | 11 | Ollama `keep_alive`: `OllamaTransport.warm()` (native-API pre-load, `player2/agent/ollama_transport.py`) + `ollama_keep_alive` config field + `demo.py` wiring (`--ollama-keep-alive`) | Terra/medium (`warm()`) + Luna/low (`config.py` field) + **Claude** (`demo.py` wiring) | Terra/high | 4 | 2 real, both confirmed by direct reproduction; 2 accepted as documented limitations (not fixed) | 0 | (not separately logged this call) | See notes below. Both real findings were confirmed BEFORE trusting the reviewer's writeup, by re-running the exact failure live — same discipline the design phase used to disprove an assumption about the OpenAI-compat endpoint in the first place. |
+| 12 | Per-frame relative timestamps in `observation_to_prompt()` (`player2/agent/model_schema.py`) — infrastructure for a future multi-frame observation, deliberately not paired with actually raising `frames_per_observation` above 1 | **Claude** | Terra/high | 3 | 1 accepted-but-unreachable (tightened via docs, not runtime validation — no real caller violates it); 2 real, fixed (`-0 ms` float-formatting artifact; loose substring tests that would pass on a mislabeled frame) | 0 | (not separately logged this call) | See notes below. Joey's own framing going in: "there's a good chance we make the overall experience worse" once frame count actually rises — this unit deliberately ships only the labeling infrastructure, guarded to be a no-op at today's default, so that risk stays isolated to a future, explicitly measured step. |
+| 13 | Fix: unbounded scheduler history in `observation_to_prompt()` grew past the model's 4096-token context ceiling over a long session, corrupting every response (`player2/agent/model_schema.py`, `model_policy.py`, `config.py`, `demo.py` — new `history_window`, capped and configurable) | **Claude** | Terra/high | 2 | 2 real, both fixed (a self-caught truthy-vs-presence bug on `--history-window 0`; a ValueError-escapes-uncaught bug in `agent()`'s exception handling, same defect class as Unit 11's `warm()` finding) | 0 | (not separately logged this call) | See notes below. Root cause found by SSH into the remote box and reading `llama-server`'s own logs directly — not inferred, not guessed at from wrapped error messages. |
+
+### Unit 13 detail — reading the other machine's logs instead of guessing at our own
+
+Direct continuation of the live 30-minute run in Unit 12's own live-verification session: 69 of
+152 decisions failed with malformed-JSON errors ("unexpected end of JSON input", "invalid
+character after decimal point"), overwhelmingly clustered in the run's second half, never
+self-recovering. Two increasingly specific hypotheses were tested and ruled out live before the
+real cause was found: (1) the newly-expanded `agent_notes` pushing total prompt size near the
+4096-token ceiling — disproven by directly reproducing the exact real payload, which measured
+2,255 tokens, nowhere near the limit; (2) the model's "thinking" tokens eating the 2048-token
+output budget — plausible but unconfirmed, no way to inspect it from the client side alone.
+
+Joey: SSH in and read the actual server. Passwordless key auth and passwordless sudo were both
+already configured on the box (`ssh -o BatchMode=yes`, `sudo -n true` — checked before asking for
+credentials, per this project's own security instincts). `journalctl -u ollama` needed `sudo`
+(the service's own logs aren't readable by a regular user); once past that, `llama-server
+--log-verbosity 4`'s per-slot logging gave the exact mechanism, no more inference needed:
+
+- `task.n_tokens` climbs by roughly 20 tokens every single decision across the whole session —
+  because `observation_to_prompt()` renders `observation.history` (the scheduler's execution
+  log) in full, and history grows every decision as more scheduler events accumulate. Nothing
+  else in the prompt grows during a session: the image is fixed-size, `agent_notes`/goal are
+  static once a session starts.
+- `n_ctx_slot = 4096` is fixed, confirmed the same hard ceiling multi-frame testing hit earlier.
+- The exact failing request: `slot release: id 0 | task 54607 | stop processing: n_tokens =
+  4095, truncated = 1`. `truncated = 1` is the smoking gun — `llama-server` cut the response off
+  wherever generation happened to be once the growing prompt filled the context window,
+  chopping the JSON tool-call output mid-string, mid-number, mid-object. The model was never
+  malfunctioning; its answer was being guillotined by the context limit.
+- One honest self-correction, caught by reading the logs rather than trusting a hunch: an
+  apparent "mysterious context reset" (`task.n_tokens` dropping to 164) turned out to be Claude's
+  own earlier diagnostic probe landing in the request queue — the server has a single processing
+  slot (`-np 1`), so investigating a live session competes with the session for the same slot.
+
+Claude wrote tests first (`tests/test_agent_model_schema.py`, `test_agent_model_policy.py`,
+`test_config.py`), implemented `observation_to_prompt(observation, *, history_window=30)`
+(renders `observation.history[-history_window:]`, not the full tuple, with an "N older event(s)
+omitted" note only when something was actually dropped) directly since it's a small, precisely
+tested change. `SDKPolicy` gained a matching constructor parameter (same positive-int validation
+shape as its existing `max_image_dim`/`jpeg_quality`) threaded into both `propose()` and
+`deliberate()`. `AgentLoop`'s own 256-event retention is unchanged — only what gets rendered into
+the prompt is windowed. `player2/config.py` gained a `history_window` field mirroring
+`ollama_keep_alive`'s shape exactly, routed to **Luna/low** (a deliberate test of the standing
+question about mechanical work, clean diff on the first pass). `--history-window` wired into
+`demo.py`, following the same CLI > env > `.env` > default precedence as every other knob.
+
+**Self-caught one defect before requesting review**: the first `demo.py` draft copied the
+existing `if ollama_base_url:` truthy-check pattern for the new `sdk_kwargs["history_window"]`
+assignment — correct for strings (where `""` and `None` are both meaningless, already filtered
+upstream), wrong for an int where `0` is a real, if invalid, value. `--history-window 0` would
+have silently fallen back to `SDKPolicy`'s own default instead of reaching its validation error.
+Reproduced directly (`sdk_kwargs` stayed `{}` for an explicit `0`), fixed to a presence check
+(`is not None`), reproduced clean after.
+
+**Terra/high review, 2 findings, both real:**
+
+1. **P2, confirmed by reproduction.** `config.py`'s `_parse_history_window` validates type
+   (coerces a string to int) but not range — a well-typed but invalid value (`0`, negative)
+   sails through config resolution untouched and is only caught by `SDKPolicy`'s own
+   construction-time validation, which runs *after* `agent()` has already started the recorder
+   and video capture. `agent()`'s `except ImportError` around `_build_sdk_policy()` didn't catch
+   the resulting `ValueError`, so it would have escaped uncaught and skipped
+   `recorder.stop()`/`video.stop()` — the identical defect class Unit 11 already found and fixed
+   for `warm()`'s `OSError`, just reached through a different, newly-added parameter. Reproduced
+   directly (`_build_sdk_policy('cli', ..., history_window=0)` raised `ValueError` uncaught by
+   the existing handler). Fixed by broadening the catch to `except (ImportError, ValueError)`.
+2. **P3, confirmed, fixed.** The new `SDKPolicy` test covered `history_window` threading through
+   `propose()` but not `deliberate()` — both call sites do pass it correctly (Terra verified
+   manually), but a future one-call-site regression wouldn't have been caught. Added the missing
+   test.
+
+**Live-verified against the real server after the fix**, same rigor as the root-cause
+investigation: sent a request with 50 history events (more than the ~24 that had already caused
+visible degradation in the original run) through the real `SDKPolicy`/`OllamaTransport` path.
+Client reported `input_tokens=2517`; the server's own log for that exact request confirmed
+`task.n_tokens = 2517` and, critically, **`truncated = 0`** — no truncation, unlike the
+`truncated = 1` that caused the original collapse. Same diagnostic method that found the bug now
+proves the fix, not a different, less rigorous one.
+
+Final: 609 tests passing, ruff and mypy `--strict` clean. Deferred idea (summarizing/compacting
+dropped history instead of discarding it) logged on the roadmap in `docs/CARRYOVER.md` §7 rather
+than built now — not enough evidence yet that simple truncation costs real decision quality.
+
+### Unit 12 detail — infrastructure ahead of an experiment, not the experiment itself
+
+Joey asked directly: does the model get any timestamp with the frames it sees, given how much
+motor timing matters? Answer, checked against the actual code rather than assumed: at today's
+default (`frames_per_observation=1`, everywhere in the SDK path), yes — the single frame's
+timestamp IS the observation's cutoff, stated in the prompt. But `observation_to_prompt()` never
+enumerated per-frame timestamps, so if `frames_per_observation` were ever raised above 1 to let
+the model perceive motion across several stills, the model would receive N images with no way to
+know the time gap between them — the per-frame data (`Frame.session_ms`) already existed, the
+text renderer just never used it.
+
+Joey, unprompted, drew the right line before any code was written: this could easily make the
+overall experience *worse*, not better — more image tokens per decision directly fights the
+9.6-90s latency this session already spent real effort reducing (Units 9-11), and "we just set a
+real baseline (v0.2.0), I'm glad we have it to compare against" was the explicit framing. So this
+unit ships ONLY the labeling infrastructure, guarded (`if len(observation.frames) > 1`) to be a
+verified no-op — zero added tokens, zero behavior change — at the shipped default. Raising
+`frames_per_observation` itself stays a deliberately separate, future, measured step: latency and
+token cost at N=3/N=5 compared directly against tonight's numbers on the same remote box, before
+any default changes.
+
+Claude wrote tests first (`tests/test_agent_model_schema.py`), implemented directly (small,
+well-specified, in an already-tested module), sent to Terra/high for review. **3 findings, 2
+real:**
+
+1. **Medium, real but unreachable today — accepted via documentation, not runtime validation.**
+   The prompt's "oldest to newest, 0 ms = newest" claim assumes `observation.frames` is sorted
+   ascending by `session_ms`; nothing enforces that structurally. Reproduced with a permitted
+   (if unrealistic) out-of-order `Observation` — the claim genuinely becomes false, an earlier
+   frame gets labeled `0 ms`. Not fixed with a runtime check: `AgentLoop._decide()` is the only
+   real constructor of an `Observation` in this codebase, and WGC — the only real
+   `IVideoSource` — already rejects backwards session times, so no reachable caller violates
+   this. Adding validation against an unreachable input would be exactly the kind of scope this
+   project's own conventions argue against. Fixed instead by tightening
+   `IVideoSource.latest()`'s docstring to state the ascending-`session_ms` contract explicitly
+   rather than the vaguer "chronological" — closing the "silently assumed" gap without dead code.
+2. **Low, real, fixed.** Relative offsets were formatted with Python's `:g`, which renders a
+   frame captured a fraction of a millisecond before the cutoff as `-0 ms` (confirmed:
+   `f"{-0.3:.0f}"` → `"-0"`) — a genuinely confusing label for a model reasoning about direction
+   of motion, and more reachable than the initial "Low" severity suggested (any two frames
+   within 0.5ms of each other trigger it). Fixed with `round()` to a plain Python int before
+   formatting — ints have no signed zero, so this is structurally impossible after the fix, not
+   just less likely.
+3. **Low, real, fixed.** The multi-frame test only substring-matched (`"-520" in text`), which
+   would still pass if a label were attached to the wrong frame. Rewritten to assert exact lines
+   in the rendered output, plus a dedicated regression test for the `-0 ms` case above.
+
+Final: 592 tests passing, ruff and mypy `--strict` clean.
 
 ### Unit 9 detail — a second machine, and a defect only the untested half produced
 

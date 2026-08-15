@@ -32,6 +32,7 @@ class TestDefaults:
             budget_tpm=60_000.0,
             ollama_base_url=None,
             ollama_keep_alive=None,
+            history_window=None,
             recordings="recordings",
             profile=None,
         )
@@ -86,6 +87,14 @@ class TestPrecedence:
         )
         assert config.budget_tpm == 12_000.0
 
+    def test_precedence_holds_for_history_window_with_type_coercion(self) -> None:
+        config = resolve_runtime_config(
+            cli={},
+            environ={"PLAYER2_HISTORY_WINDOW": "10"},
+            dotenv={"PLAYER2_HISTORY_WINDOW": "5"},
+        )
+        assert config.history_window == 10
+
     def test_precedence_holds_for_model_recordings_and_profile(self) -> None:
         config = resolve_runtime_config(
             cli={},
@@ -127,6 +136,12 @@ class TestAbsentIsNotEmpty:
         )
         assert config.ollama_keep_alive is None
 
+    def test_empty_history_window_env_var_falls_through_to_hardcoded_default(self) -> None:
+        config = resolve_runtime_config(
+            cli={}, environ={"PLAYER2_HISTORY_WINDOW": ""}, dotenv={},
+        )
+        assert config.history_window is None
+
     def test_cli_key_present_with_falsy_value_still_wins(self) -> None:
         """Presence in the cli mapping decides, not truthiness -- a real --budget-tpm 0 must
         not be mistaken for "not passed" just because 0 is falsy in Python."""
@@ -145,6 +160,10 @@ class TestValidation:
     def test_non_numeric_budget_tpm_from_dotenv_raises_a_clear_error(self) -> None:
         with pytest.raises(ValueError, match="budget_tpm|BUDGET_TPM"):
             resolve_runtime_config(cli={}, environ={}, dotenv={"PLAYER2_BUDGET_TPM": "lots"})
+
+    def test_non_numeric_history_window_from_dotenv_raises_a_clear_error(self) -> None:
+        with pytest.raises(ValueError, match="history_window|HISTORY_WINDOW"):
+            resolve_runtime_config(cli={}, environ={}, dotenv={"PLAYER2_HISTORY_WINDOW": "lots"})
 
 
 class TestLoadDotenvFile:

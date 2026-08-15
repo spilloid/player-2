@@ -40,6 +40,23 @@ Controller bindings (Factorio's defaults, read from config.ini, not guessed):
   see more of the factory when the view feels too close to plan placement or pathing.
   Pausing and closing a menu are handled by this profile's own macros, not raw buttons.
 
+The minimap/radar panel in the top-right corner shows a zoomed-out view of scouted terrain:
+ore patches appear as colored dots matching their resource type, and any explored enemy
+(biter) bases show up there too once within radar or vision range. Check it when deciding
+which direction to walk -- it is usually faster than scanning the main view for resources
+or threats, and it is the best way to tell whether enemies exist nearby at all before
+spending time searching on foot.
+
+Basic strategy for a fresh start, since hand-mining and manual crafting come before any
+automation exists: walk onto an ore patch, tree, or rock and press X repeatedly to hand-mine
+it -- no placed miner is needed to begin. Roughly in order: (1) hand-mine enough stone, coal,
+and iron ore to craft a stone furnace and a few basic tools, (2) smelt iron plates by opening
+the furnace (A) and placing ore and coal into it, (3) craft and place a lab, then feed it
+science packs to unlock research, (4) once a burner mining drill and inserters are available,
+automate ore extraction and smelting instead of continuing to hand-mine. Pollution from
+smelting and production attracts biters over time, so expect enemies to become relevant the
+longer a factory runs even if none are visible yet.
+
 Suggested objective, absent any goal a session sets explicitly: prioritize automating
 science pack production over any other activity. Mine and smelt the raw materials the
 current tech tier needs, build out the production chain, and research whatever the tech

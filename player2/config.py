@@ -22,6 +22,7 @@ class RuntimeConfig:
     budget_tpm: float
     ollama_base_url: str | None
     ollama_keep_alive: str | None
+    history_window: int | None
     recordings: str
     profile: str | None
 
@@ -52,6 +53,17 @@ def _parse_budget(value: object) -> float:
         except ValueError as exc:
             raise ValueError(f"invalid budget_tpm value: {value!r}") from exc
     return cast(float, value)
+
+
+def _parse_history_window(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise ValueError(f"invalid history_window value: {value!r}") from exc
+    return cast(int, value)
 
 
 def resolve_runtime_config(
@@ -91,6 +103,14 @@ def resolve_runtime_config(
         env_key="PLAYER2_OLLAMA_KEEP_ALIVE",
         default=None,
     )
+    history_window, _ = _resolve_value(
+        cli,
+        environ,
+        dotenv,
+        cli_key="history_window",
+        env_key="PLAYER2_HISTORY_WINDOW",
+        default=None,
+    )
     recordings, _ = _resolve_value(
         cli,
         environ,
@@ -109,6 +129,7 @@ def resolve_runtime_config(
         budget_tpm=_parse_budget(budget_tpm),
         ollama_base_url=cast(str | None, ollama_base_url),
         ollama_keep_alive=cast(str | None, ollama_keep_alive),
+        history_window=_parse_history_window(history_window),
         recordings=cast(str, recordings),
         profile=cast(str | None, profile),
     )

@@ -43,7 +43,14 @@ class IVideoSource(Protocol):
         ...
 
     def latest(self, n: int = 1) -> tuple[Frame, ...]:
-        """Return a stable chronological snapshot of the most recent frames."""
+        """Return a stable snapshot of the most recent frames, oldest to newest.
+
+        "Chronological" here specifically means ascending `Frame.session_ms` -- the last
+        element must be the newest by that field. model_schema.observation_to_prompt() relies
+        on this to label multi-frame observations with a per-frame relative timestamp; an
+        implementation returning frames in arrival order rather than capture order would make
+        that labeling silently wrong for a source with any reordering between the two.
+        """
         ...
 
     @property

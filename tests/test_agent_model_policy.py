@@ -22,6 +22,7 @@ from player2.agent.base import IDeliberativeModel, IFastPolicy, Observation
 from player2.agent.model_policy import ModelTransportError, SDKPolicy
 from player2.agent.model_schema import ACTION_CHUNK_TOOL_NAME, ModelResponseError
 from player2.contracts import Frame
+from player2.control.scheduler import EventKind, SchedulerEvent
 
 
 def solid_frame(seq: int = 0, session_ms: float = 0.0) -> Frame:
@@ -31,8 +32,9 @@ def solid_frame(seq: int = 0, session_ms: float = 0.0) -> Frame:
                  pixel_format="BGRA8", data=buffer)
 
 
-def observation(frames: tuple[Frame, ...] = (), goal: str | None = "test goal") -> Observation:
-    return Observation(frames=frames or (solid_frame(),), goal=goal, history=(),
+def observation(frames: tuple[Frame, ...] = (), goal: str | None = "test goal",
+                 history: tuple[SchedulerEvent, ...] = ()) -> Observation:
+    return Observation(frames=frames or (solid_frame(),), goal=goal, history=history,
                        observation_cutoff_ms=0.0, deadline_ms=100.0, epoch=0, decision_seq=0)
 
 
@@ -141,6 +143,21 @@ class TestPropose:
         policy.propose(observation())
         assert transport.tool_calls[0].timeout_s == 3.5
 
+    def test_passes_the_configured_history_window_through(self) -> None:
+        """A live 30-minute session (docs/DEV-PROCESS.md) grew its prompt past the model's
+        4096-token context ceiling because history was rendered in full -- SDKPolicy must
+        actually apply its configured window, not just accept the constructor argument."""
+        events = tuple(
+            SchedulerEvent(kind=EventKind.PREEMPTED, session_ms=float(i), detail=f"seq={i}")
+            for i in range(10)
+        )
+        transport = FakeTransport(tool_result=VALID_CHUNK_PAYLOAD)
+        policy = SDKPolicy(transport=transport, history_window=3)
+        policy.propose(observation(history=events))
+        prompt = transport.tool_calls[0].prompt
+        assert "seq=9" in prompt
+        assert "seq=6" not in prompt
+
 
 class TestDeliberate:
     def test_returns_the_transport_text_stripped(self) -> None:
@@ -161,6 +178,20 @@ class TestDeliberate:
         assert "scout the area" in transport.text_calls[0].prompt
         assert len(transport.text_calls[0].images) == 1
 
+    def test_passes_the_configured_history_window_through(self) -> None:
+        """propose() and deliberate() both build a prompt from the same observation --
+        deliberate() must get the same history_window protection, not just propose()."""
+        events = tuple(
+            SchedulerEvent(kind=EventKind.PREEMPTED, session_ms=float(i), detail=f"seq={i}")
+            for i in range(10)
+        )
+        transport = FakeTransport(text_result="goal")
+        policy = SDKPolicy(transport=transport, history_window=3)
+        policy.deliberate(observation(history=events))
+        prompt = transport.text_calls[0].prompt
+        assert "seq=9" in prompt
+        assert "seq=6" not in prompt
+
     def test_a_transport_failure_propagates(self) -> None:
         transport = FakeTransport(text_error=ModelTransportError("timed out"))
         policy = SDKPolicy(transport=transport)
@@ -176,6 +207,10 @@ class TestConstruction:
     def test_rejects_a_non_finite_timeout(self) -> None:
         with pytest.raises(ValueError):
             SDKPolicy(transport=FakeTransport(), timeout_s=float("nan"))
+
+    def test_rejects_a_non_positive_history_window(self) -> None:
+        with pytest.raises(ValueError):
+            SDKPolicy(transport=FakeTransport(), history_window=0)
 
     def test_default_construction_needs_only_a_transport(self) -> None:
         SDKPolicy(transport=FakeTransport())

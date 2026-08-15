@@ -268,6 +268,21 @@ full coding-agent scaffold per invocation. One decision every 2s ⇒ ~1.9M token
    registry entirely. Full account in `docs/DEV-PROCESS.md`'s 2026-08-13 live-verification
    note.
 8. Segmented hardware-accelerated video (Quick Sync) — the remaining storage 10x.
+9. **Smarter history compaction for the SDK prompt, once it's less of a lift.** A live
+   30-minute session found and root-caused a real failure: `observation_to_prompt()` rendered
+   the ENTIRE scheduler execution history into every prompt, unbounded, and a long enough
+   session grows that text past the model's context window entirely on its own — confirmed
+   directly from the remote Ollama server's own logs (`llama-server`'s `truncated = 1`), which
+   corrupts the model's JSON output mid-generation, not a clean failure. Fixed for now with the
+   simplest sufficient thing: `history_window` caps the prompt to the most recent N events
+   (default 30), oldest dropped first, configurable via `--history-window`/
+   `PLAYER2_HISTORY_WINDOW`/`.env`. Deliberately NOT built yet: summarizing or compacting the
+   dropped older history instead of just discarding it (e.g. "12 similar chunks accepted,
+   minor movement" instead of losing that stretch entirely) would preserve more signal per
+   token, but needs either another model call or a real heuristic compactor — meaningfully more
+   complexity than a first pass warrants before knowing whether simple truncation already loses
+   anything the model actually needed. Revisit once there's evidence truncation is costing
+   real decision quality, not before. Full root-cause account in `docs/DEV-PROCESS.md`.
 
 Also planned: **a GitHub docs page**, so keep documenting decisions in a form that lifts out.
 

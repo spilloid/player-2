@@ -19,6 +19,10 @@ from player2.contracts import ActionChunk
 _DEFAULT_TIMEOUT_S = 10.0
 _DEFAULT_MAX_IMAGE_DIM = 768
 _DEFAULT_JPEG_QUALITY = 85
+# Mirrors model_schema._DEFAULT_HISTORY_WINDOW -- duplicated rather than imported, same as
+# this module's own _DEFAULT_MAX_IMAGE_DIM/_DEFAULT_JPEG_QUALITY already mirror model_schema's
+# image defaults, so each module owns its own public default independently.
+_DEFAULT_HISTORY_WINDOW = 30
 
 _DEFAULT_SYSTEM_PROMPT = """You are a visuomotor game-playing policy and planner.
 Use only the supplied screenshots, goal, timing budget, and executed scheduler history.
@@ -71,6 +75,7 @@ class SDKPolicy:
         timeout_s: float = _DEFAULT_TIMEOUT_S,
         max_image_dim: int = _DEFAULT_MAX_IMAGE_DIM,
         jpeg_quality: int = _DEFAULT_JPEG_QUALITY,
+        history_window: int = _DEFAULT_HISTORY_WINDOW,
     ) -> None:
         """Bind a transport and validate the shared request and image configuration."""
         if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
@@ -89,17 +94,21 @@ class SDKPolicy:
         if (isinstance(jpeg_quality, bool) or not isinstance(jpeg_quality, int)
                 or not 1 <= jpeg_quality <= 100):
             raise ValueError("jpeg_quality must be an integer from 1 through 100")
+        if (isinstance(history_window, bool) or not isinstance(history_window, int)
+                or history_window <= 0):
+            raise ValueError("history_window must be a positive integer")
         self._transport = transport
         self._timeout_s = timeout
         self._system_prompt = system_prompt
         self._max_image_dim = max_image_dim
         self._jpeg_quality = jpeg_quality
+        self._history_window = history_window
 
     def propose(self, observation: Observation) -> ActionChunk | None:
         """Request one structured action and validate it at the model-response boundary."""
         payload = self._transport.complete_tool(
             system=self._system_prompt,
-            prompt=observation_to_prompt(observation),
+            prompt=observation_to_prompt(observation, history_window=self._history_window),
             images=observation_to_images(
                 observation,
                 max_dim=self._max_image_dim,
@@ -115,7 +124,7 @@ class SDKPolicy:
         """Request one compact goal, treating provider whitespace as no guidance."""
         response = self._transport.complete_text(
             system=self._system_prompt,
-            prompt=observation_to_prompt(observation),
+            prompt=observation_to_prompt(observation, history_window=self._history_window),
             images=observation_to_images(
                 observation,
                 max_dim=self._max_image_dim,
