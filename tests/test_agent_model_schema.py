@@ -25,7 +25,7 @@ from player2.agent.model_schema import (
     observation_to_prompt,
     parse_action_chunk,
 )
-from player2.contracts import Button, Frame
+from player2.contracts import MAX_COMMENTARY_CHARS, Button, Frame
 from player2.control.scheduler import EventKind, SchedulerEvent
 
 
@@ -69,6 +69,37 @@ class TestActionChunkToolSchema:
         keyframe_schema = schema["properties"]["keyframes"]["items"]
         buttons_enum = set(keyframe_schema["properties"]["buttons"]["items"]["enum"])
         assert buttons_enum == {button.value for button in Button}
+
+    def test_commentary_is_optional_by_default(self) -> None:
+        """Default: a scripted or terse model must not be forced to narrate. Confirmed live
+        (docs/DEV-PROCESS.md, Unit 14) that this is not merely permissive -- against a local
+        grammar-constrained model, "optional" means the field is realistically never used,
+        which is exactly why `require_commentary` exists as an opt-in override below."""
+        schema = action_chunk_tool_schema()
+        assert "commentary" not in schema["required"]
+
+    def test_commentary_schema_is_bounded_regardless_of_required_state(self) -> None:
+        """Bounded to the same limit contracts.py enforces so a schema-obeying model can
+        never get rejected at the runtime boundary purely for length."""
+        schemas = (action_chunk_tool_schema(), action_chunk_tool_schema(require_commentary=True))
+        for schema in schemas:
+            commentary_schema = schema["properties"]["commentary"]
+            assert commentary_schema["type"] == "string"
+            assert commentary_schema["maxLength"] == MAX_COMMENTARY_CHARS
+            # Guidance only, not an enforcement boundary a provider might ignore: an empty
+            # string that gets through anyway is not rejected (it carries no controller-safety
+            # weight, so there is no reason to throw away an otherwise-valid movement chunk
+            # over it) -- contracts.py and demo.py's formatter just treat it the same as "no
+            # commentary given" wherever it would otherwise show up.
+            assert commentary_schema["minLength"] == 1
+
+    def test_require_commentary_true_adds_it_to_the_required_list(self) -> None:
+        schema = action_chunk_tool_schema(require_commentary=True)
+        assert set(schema["required"]) == {"keyframes", "commentary"}
+
+    def test_require_commentary_does_not_change_keyframes_requirement(self) -> None:
+        schema = action_chunk_tool_schema(require_commentary=True)
+        assert "keyframes" in schema["required"]
 
     def test_is_stable_json_serialisable_shape(self) -> None:
         """No tuples, no sets, no enums leaking into the schema -- some SDKs json.dumps this
@@ -216,6 +247,13 @@ class TestParseActionChunk:
         ]}
         chunk = parse_action_chunk(payload)
         assert chunk.keyframes[0].left_stick == (1.0, 0.0)
+
+    def test_carries_commentary_through_when_present(self) -> None:
+        payload = {"keyframes": [{"t_ms": 0.0}], "commentary": "circling back for ammo"}
+        assert parse_action_chunk(payload).commentary == "circling back for ammo"
+
+    def test_commentary_defaults_to_none_when_absent(self) -> None:
+        assert parse_action_chunk({"keyframes": [{"t_ms": 0.0}]}).commentary is None
 
     def test_wraps_an_invalid_chunk_as_a_model_response_error(self) -> None:
         """chunk_from_dict raises InvalidChunk for the runtime's own decode path (recorded

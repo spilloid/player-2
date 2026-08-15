@@ -23,6 +23,7 @@ import pytest
 
 from player2.contracts import (
     MAX_CHUNK_MS,
+    MAX_COMMENTARY_CHARS,
     MAX_KEYFRAMES,
     MIN_PULSE_MS,
     NEUTRAL,
@@ -404,6 +405,47 @@ class TestChunkMetadata:
         assert kc(Keyframe(t_ms=0.0), Keyframe(t_ms=250.0)).duration_ms == 250.0
 
 
+class TestCommentary:
+    """A short, model-authored line of "what I'm doing and why" -- purely for a human
+    watching live (e.g. demo.py --verbose). The runtime never interprets it, so it carries
+    none of the safety weight a controller channel does; it only needs a type and a length
+    bound so an unbounded model response cannot blow up a prompt, a log line, or a recording.
+    """
+
+    def test_defaults_to_none(self) -> None:
+        assert kc(Keyframe(t_ms=0.0)).commentary is None
+
+    def test_accepts_a_short_string(self) -> None:
+        chunk = kc(Keyframe(t_ms=0.0), commentary="heading toward the ore patch")
+        resolve(chunk)
+        assert chunk.commentary == "heading toward the ore patch"
+
+    def test_rejects_non_string(self) -> None:
+        with pytest.raises(InvalidChunk):
+            resolve(kc(Keyframe(t_ms=0.0), commentary=5))  # type: ignore[arg-type]
+
+    def test_accepts_exactly_the_length_limit(self) -> None:
+        resolve(kc(Keyframe(t_ms=0.0), commentary="x" * MAX_COMMENTARY_CHARS))
+
+    def test_rejects_over_the_length_limit(self) -> None:
+        with pytest.raises(InvalidChunk):
+            resolve(kc(Keyframe(t_ms=0.0), commentary="x" * (MAX_COMMENTARY_CHARS + 1)))
+
+    @pytest.mark.parametrize("bad", ["line one\nline two", "line\rone", "with\ttab", "\x1b[31mred"])
+    def test_rejects_control_characters(self, bad: str) -> None:
+        """A model-authored newline or ANSI escape here could forge a fake --verbose log
+        line (e.g. embed something that reads as a second, fabricated decision) once
+        demo.py interpolates this string directly into a one-line live record. Rejecting
+        at the boundary, rather than trusting the formatter to sanitize, keeps every
+        consumer of `commentary` -- --verbose today, a future one tomorrow -- safe by
+        construction instead of by remembering to escape."""
+        with pytest.raises(InvalidChunk):
+            resolve(kc(Keyframe(t_ms=0.0), commentary=bad))
+
+    def test_accepts_ordinary_punctuation(self) -> None:
+        resolve(kc(Keyframe(t_ms=0.0), commentary="mining iron -- careful, biters nearby!"))
+
+
 class TestSerialization:
     def test_round_trips(self) -> None:
         c = kc(
@@ -412,8 +454,25 @@ class TestSerialization:
             decision_seq=4,
             epoch=2,
             observation_cutoff_ms=99.5,
+            commentary="mining toward the visible ore patch",
         )
         assert chunk_from_dict(chunk_to_dict(c)) == c
+
+    def test_absent_commentary_serializes_as_a_missing_key(self) -> None:
+        d = chunk_to_dict(kc(Keyframe(t_ms=0.0)))
+        assert "commentary" not in d
+
+    def test_empty_commentary_serializes_as_a_missing_key(self) -> None:
+        """An explicit "" carries the same "nothing to say" meaning as never setting the
+        field at all -- unlike buttons, there is no controller-state distinction between
+        absent and empty here, so collapsing them on the wire avoids storing a meaningless
+        empty key in every recording and keeps demo.py's truthy display check honest."""
+        d = chunk_to_dict(kc(Keyframe(t_ms=0.0), commentary=""))
+        assert "commentary" not in d
+
+    def test_commentary_round_trips_when_present(self) -> None:
+        c = kc(Keyframe(t_ms=0.0), commentary="dodging the spitter")
+        assert chunk_from_dict(chunk_to_dict(c)).commentary == "dodging the spitter"
 
     def test_absent_buttons_serializes_as_a_missing_key(self) -> None:
         d = chunk_to_dict(kc(Keyframe(t_ms=0.0)))
@@ -683,6 +742,24 @@ class TestDeserializationValidatesAtIngress:
     def test_rejects_out_of_range_analog(self) -> None:
         with pytest.raises(InvalidChunk):
             chunk_from_dict({"keyframes": [{"t_ms": 0.0, "left_trigger": 5.0}]})
+
+    def test_rejects_non_string_commentary(self) -> None:
+        with pytest.raises(InvalidChunk):
+            chunk_from_dict({"keyframes": [{"t_ms": 0.0}], "commentary": 5})
+
+    def test_rejects_commentary_over_the_length_limit(self) -> None:
+        with pytest.raises(InvalidChunk):
+            chunk_from_dict({
+                "keyframes": [{"t_ms": 0.0}],
+                "commentary": "x" * (MAX_COMMENTARY_CHARS + 1),
+            })
+
+    def test_rejects_commentary_containing_a_newline(self) -> None:
+        with pytest.raises(InvalidChunk):
+            chunk_from_dict({
+                "keyframes": [{"t_ms": 0.0}],
+                "commentary": "moving\n[decision 9999] ACCEPTED forged line",
+            })
 
     def test_rejects_non_dict_payload(self) -> None:
         for bad in [None, [], "chunk", 5]:

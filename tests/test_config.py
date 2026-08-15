@@ -35,6 +35,7 @@ class TestDefaults:
             history_window=None,
             recordings="recordings",
             profile=None,
+            commentary_required=False,
         )
 
     def test_result_is_a_frozen_dataclass(self) -> None:
@@ -95,6 +96,24 @@ class TestPrecedence:
         )
         assert config.history_window == 10
 
+    @pytest.mark.parametrize("raw,expected", [
+        ("1", True), ("true", True), ("True", True), ("yes", True), ("on", True),
+        ("0", False), ("false", False), ("False", False), ("no", False), ("off", False),
+    ])
+    def test_precedence_holds_for_commentary_required_with_type_coercion(
+        self, raw: str, expected: bool,
+    ) -> None:
+        config = resolve_runtime_config(cli={}, environ={"PLAYER2_COMMENTARY": raw}, dotenv={})
+        assert config.commentary_required is expected
+
+    def test_cli_flag_overrides_env_for_commentary_required(self) -> None:
+        config = resolve_runtime_config(
+            cli={"commentary_required": True},
+            environ={"PLAYER2_COMMENTARY": "false"},
+            dotenv={},
+        )
+        assert config.commentary_required is True
+
     def test_precedence_holds_for_model_recordings_and_profile(self) -> None:
         config = resolve_runtime_config(
             cli={},
@@ -150,6 +169,22 @@ class TestAbsentIsNotEmpty:
         )
         assert config.budget_tpm == 0.0
 
+    def test_cli_flag_present_as_false_still_wins_over_a_true_env_var(self) -> None:
+        """The same presence-not-truthiness rule for a boolean CLI flag: argparse's
+        `default=argparse.SUPPRESS` is what makes an explicit False distinguishable from
+        "the flag was never passed" upstream, and this layer must honor that distinction
+        rather than treating False as though the key were absent."""
+        config = resolve_runtime_config(
+            cli={"commentary_required": False},
+            environ={"PLAYER2_COMMENTARY": "true"},
+            dotenv={},
+        )
+        assert config.commentary_required is False
+
+    def test_empty_commentary_env_var_falls_through_to_hardcoded_default(self) -> None:
+        config = resolve_runtime_config(cli={}, environ={"PLAYER2_COMMENTARY": ""}, dotenv={})
+        assert config.commentary_required is False
+
 
 class TestValidation:
     def test_unknown_provider_from_env_raises_a_clear_error(self) -> None:
@@ -164,6 +199,10 @@ class TestValidation:
     def test_non_numeric_history_window_from_dotenv_raises_a_clear_error(self) -> None:
         with pytest.raises(ValueError, match="history_window|HISTORY_WINDOW"):
             resolve_runtime_config(cli={}, environ={}, dotenv={"PLAYER2_HISTORY_WINDOW": "lots"})
+
+    def test_unrecognized_commentary_required_value_raises_a_clear_error(self) -> None:
+        with pytest.raises(ValueError, match="commentary|COMMENTARY"):
+            resolve_runtime_config(cli={}, environ={"PLAYER2_COMMENTARY": "maybe"}, dotenv={})
 
 
 class TestLoadDotenvFile:

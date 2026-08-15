@@ -7,6 +7,7 @@ from typing import Any
 from player2.agent.base import Observation
 from player2.contracts import (
     MAX_CHUNK_MS,
+    MAX_COMMENTARY_CHARS,
     MAX_KEYFRAMES,
     ActionChunk,
     Button,
@@ -42,8 +43,17 @@ def _stick_schema() -> dict[str, Any]:
     }
 
 
-def action_chunk_tool_schema() -> dict[str, Any]:
-    """Describe sparse action authoring while leaving final validation to contracts.py."""
+def action_chunk_tool_schema(*, require_commentary: bool = False) -> dict[str, Any]:
+    """Describe sparse action authoring while leaving final validation to contracts.py.
+
+    `require_commentary` exists because "optional" turned out not to mean what it sounds like
+    for local, grammar-constrained tool-calling: confirmed live (docs/DEV-PROCESS.md, Unit 14)
+    that a model satisfies `required` and stops, so an optional field can go unused on every
+    single decision regardless of what the system prompt asks for. Runtime validation of
+    `commentary` in contracts.py is unaffected either way -- it stays optional there
+    (`None` is always a legal value) since this flag is purely a prompting lever, not a
+    controller-safety one.
+    """
     keyframe_schema: dict[str, Any] = {
         "type": "object",
         "properties": {
@@ -80,9 +90,21 @@ def action_chunk_tool_schema() -> dict[str, Any]:
                     "Sparse controller states in strictly increasing time order; the first "
                     "keyframe must have t_ms=0. Omitted channels inherit their previous value."
                 ),
-            }
+            },
+            "commentary": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_COMMENTARY_CHARS,
+                "description": (
+                    "One short, plain-English line on what you're doing right now and why -- "
+                    "shown live to the human watching this session, never interpreted by the "
+                    "game or the runtime. Say it like you're narrating your own play, not "
+                    "documenting a function. A single line: no newlines or other control "
+                    "characters."
+                ),
+            },
         },
-        "required": ["keyframes"],
+        "required": ["keyframes", "commentary"] if require_commentary else ["keyframes"],
         "additionalProperties": False,
     }
 

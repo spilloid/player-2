@@ -143,6 +143,21 @@ class TestPropose:
         policy.propose(observation())
         assert transport.tool_calls[0].timeout_s == 3.5
 
+    def test_commentary_is_optional_in_the_tool_schema_by_default(self) -> None:
+        transport = FakeTransport(tool_result=VALID_CHUNK_PAYLOAD)
+        SDKPolicy(transport=transport).propose(observation())
+        assert "commentary" not in transport.tool_calls[0].tool_schema["required"]
+
+    def test_require_commentary_makes_it_required_in_the_tool_schema(self) -> None:
+        """Confirmed live (docs/DEV-PROCESS.md, Unit 14) that the default optional field goes
+        unused against a local grammar-constrained model regardless of prompt wording --
+        `require_commentary` is the opt-in override that actually changes that behavior, by
+        changing the schema's own `required` list rather than asking harder in English."""
+        transport = FakeTransport(tool_result=VALID_CHUNK_PAYLOAD)
+        policy = SDKPolicy(transport=transport, require_commentary=True)
+        policy.propose(observation())
+        assert "commentary" in transport.tool_calls[0].tool_schema["required"]
+
     def test_passes_the_configured_history_window_through(self) -> None:
         """A live 30-minute session (docs/DEV-PROCESS.md) grew its prompt past the model's
         4096-token context ceiling because history was rendered in full -- SDKPolicy must
@@ -211,6 +226,10 @@ class TestConstruction:
     def test_rejects_a_non_positive_history_window(self) -> None:
         with pytest.raises(ValueError):
             SDKPolicy(transport=FakeTransport(), history_window=0)
+
+    def test_rejects_a_non_bool_require_commentary(self) -> None:
+        with pytest.raises(ValueError):
+            SDKPolicy(transport=FakeTransport(), require_commentary="yes")  # type: ignore[arg-type]
 
     def test_default_construction_needs_only_a_transport(self) -> None:
         SDKPolicy(transport=FakeTransport())

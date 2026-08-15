@@ -27,8 +27,10 @@ _DEFAULT_HISTORY_WINDOW = 30
 _DEFAULT_SYSTEM_PROMPT = """You are a visuomotor game-playing policy and planner.
 Use only the supplied screenshots, goal, timing budget, and executed scheduler history.
 For a tool request, author sparse action keyframes relative to t_ms=0 and keep the action short
-enough for correction by the next observation. For a text request, return one concise goal for
-the fast controller policy without JSON, controller keyframes, or commentary."""
+enough for correction by the next observation; also fill in the optional `commentary` field with
+one short, plain-English line on what you're doing right now and why, for a human watching live.
+For a text request, return one concise goal for the fast controller policy without JSON,
+controller keyframes, or commentary."""
 
 
 class ModelTransportError(RuntimeError):
@@ -76,8 +78,14 @@ class SDKPolicy:
         max_image_dim: int = _DEFAULT_MAX_IMAGE_DIM,
         jpeg_quality: int = _DEFAULT_JPEG_QUALITY,
         history_window: int = _DEFAULT_HISTORY_WINDOW,
+        require_commentary: bool = False,
     ) -> None:
-        """Bind a transport and validate the shared request and image configuration."""
+        """Bind a transport and validate the shared request and image configuration.
+
+        `require_commentary` only changes the tool schema's `required` list -- see
+        `action_chunk_tool_schema`'s docstring for why that, and not stronger prompt wording,
+        is what actually gets a live-narration line out of a local model.
+        """
         if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
             raise ValueError("timeout_s must be a positive finite number")
         try:
@@ -97,12 +105,15 @@ class SDKPolicy:
         if (isinstance(history_window, bool) or not isinstance(history_window, int)
                 or history_window <= 0):
             raise ValueError("history_window must be a positive integer")
+        if not isinstance(require_commentary, bool):
+            raise ValueError("require_commentary must be a bool")
         self._transport = transport
         self._timeout_s = timeout
         self._system_prompt = system_prompt
         self._max_image_dim = max_image_dim
         self._jpeg_quality = jpeg_quality
         self._history_window = history_window
+        self._require_commentary = require_commentary
 
     def propose(self, observation: Observation) -> ActionChunk | None:
         """Request one structured action and validate it at the model-response boundary."""
@@ -115,7 +126,7 @@ class SDKPolicy:
                 quality=self._jpeg_quality,
             ),
             tool_name=ACTION_CHUNK_TOOL_NAME,
-            tool_schema=action_chunk_tool_schema(),
+            tool_schema=action_chunk_tool_schema(require_commentary=self._require_commentary),
             timeout_s=self._timeout_s,
         )
         return parse_action_chunk(payload)

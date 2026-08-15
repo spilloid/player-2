@@ -12,6 +12,9 @@ TICK_MS = 1000.0 / TICK_HZ
 MIN_PULSE_MS = 2.0 * TICK_MS
 MAX_KEYFRAMES = 512
 MAX_CHUNK_MS = 5000.0
+# A live human watcher's line, not a controller channel -- bounded only so an unbounded
+# model response cannot blow up a prompt, a --verbose log line, or a recording.
+MAX_COMMENTARY_CHARS = 160
 
 
 class InvalidPadState(ValueError):
@@ -169,6 +172,7 @@ class ActionChunk:
     decision_seq: int = 0
     epoch: int = 0
     observation_cutoff_ms: float | None = None
+    commentary: str | None = None
 
     @property
     def duration_ms(self) -> float:
@@ -240,6 +244,19 @@ def _validate_chunk(chunk: ActionChunk) -> None:
             (not _finite(chunk.observation_cutoff_ms) or
              chunk.observation_cutoff_ms < 0.0)):
         raise InvalidChunk("invalid observation cutoff")
+    if chunk.commentary is not None:
+        if not isinstance(chunk.commentary, str):
+            raise InvalidChunk("commentary must be a string")
+        if len(chunk.commentary) > MAX_COMMENTARY_CHARS:
+            raise InvalidChunk(f"commentary exceeds {MAX_COMMENTARY_CHARS} characters")
+        if any(ord(char) < 0x20 for char in chunk.commentary):
+            # A newline or ANSI escape here could forge a fake extra line once a live
+            # viewer (demo.py --verbose) interpolates this string into a one-line-per-
+            # decision record -- e.g. a fabricated "[decision 9999] ACCEPTED ..." that
+            # never actually happened. Rejecting here, the one place every commentary
+            # value passes through, keeps every present and future consumer safe by
+            # construction instead of relying on each one to sanitize on the way out.
+            raise InvalidChunk("commentary must not contain control characters")
     previous = -math.inf
     for index, keyframe in enumerate(chunk.keyframes):
         # Each cause gets its own message. A model reads the rejection reason to correct its
@@ -356,8 +373,17 @@ def chunk_to_dict(chunk: ActionChunk) -> dict[str, Any]:
         if keyframe.buttons is not None:
             item["buttons"] = sorted(button.value for button in keyframe.buttons)
         keyframes.append(item)
-    return {"keyframes": keyframes, "decision_seq": chunk.decision_seq,
-            "epoch": chunk.epoch, "observation_cutoff_ms": chunk.observation_cutoff_ms}
+    payload: dict[str, Any] = {"keyframes": keyframes, "decision_seq": chunk.decision_seq,
+                               "epoch": chunk.epoch,
+                               "observation_cutoff_ms": chunk.observation_cutoff_ms}
+    if chunk.commentary:
+        # Truthy, not `is not None`: an explicit "" carries the same "nothing to say"
+        # meaning as never setting the field, unlike buttons, which have no such
+        # controller-state distinction between absent and empty. Collapsing the two here
+        # keeps a recorded session free of meaningless empty commentary keys and matches
+        # the equally truthy check demo.py's live formatter already makes on display.
+        payload["commentary"] = chunk.commentary
+    return payload
 
 
 def chunk_from_dict(payload: object) -> ActionChunk:
@@ -385,7 +411,8 @@ def chunk_from_dict(payload: object) -> ActionChunk:
         chunk = ActionChunk(keyframes=tuple(keyframes),
                            decision_seq=payload.get("decision_seq", 0),
                            epoch=payload.get("epoch", 0),
-                           observation_cutoff_ms=payload.get("observation_cutoff_ms"))
+                           observation_cutoff_ms=payload.get("observation_cutoff_ms"),
+                           commentary=payload.get("commentary"))
         resolve(chunk)
         return chunk
     except InvalidChunk:

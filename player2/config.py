@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import cast
 
 _PROVIDERS = frozenset({"anthropic", "openai", "cli", "ollama"})
+_TRUE_STRINGS = frozenset({"1", "true", "yes", "on"})
+_FALSE_STRINGS = frozenset({"0", "false", "no", "off"})
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,7 @@ class RuntimeConfig:
     history_window: int | None
     recordings: str
     profile: str | None
+    commentary_required: bool
 
 
 def _resolve_value(
@@ -53,6 +56,21 @@ def _parse_budget(value: object) -> float:
         except ValueError as exc:
             raise ValueError(f"invalid budget_tpm value: {value!r}") from exc
     return cast(float, value)
+
+
+def _parse_bool(value: object) -> bool:
+    """Coerce a CLI bool or a PLAYER2_COMMENTARY-style string, rejecting anything else loudly
+    rather than guessing -- an unrecognized string silently defaulting to False would make a
+    typo indistinguishable from an intentional opt-out."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUE_STRINGS:
+            return True
+        if lowered in _FALSE_STRINGS:
+            return False
+    raise ValueError(f"invalid commentary_required value: {value!r}")
 
 
 def _parse_history_window(value: object) -> int | None:
@@ -122,6 +140,14 @@ def resolve_runtime_config(
     profile, _ = _resolve_value(
         cli, environ, dotenv, cli_key="profile", env_key="PLAYER2_PROFILE", default=None
     )
+    commentary_required, _ = _resolve_value(
+        cli,
+        environ,
+        dotenv,
+        cli_key="commentary_required",
+        env_key="PLAYER2_COMMENTARY",
+        default=False,
+    )
 
     return RuntimeConfig(
         provider=cast(str, provider),
@@ -132,6 +158,7 @@ def resolve_runtime_config(
         history_window=_parse_history_window(history_window),
         recordings=cast(str, recordings),
         profile=cast(str | None, profile),
+        commentary_required=_parse_bool(commentary_required),
     )
 
 
