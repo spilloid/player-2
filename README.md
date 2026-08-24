@@ -6,6 +6,8 @@ A game-independent embodied AI teammate. It sees the screen, hears the game and 
 back, remembers what it learns, and plays using an ordinary controller — the same input device
 a human uses. No game APIs, no memory reading, no injection.
 
+**Current version: v0.2.1.**
+
 The test this project is built around:
 
 > Could I launch a game the AI has never played, hand it Player 2, and say
